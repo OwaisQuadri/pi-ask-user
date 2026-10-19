@@ -1,0 +1,28 @@
+{
+  "name": "pi-ask-user",
+  "version": "0.1.0",
+  "description": "Pi extension: an ask_user_question tool with single-select, multi-select, free text, Other answers, clipboard paste, and question routing from subagents to the main session.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ask-user",
+    "questions",
+    "human-in-the-loop"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
