@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -62,7 +62,11 @@ interface AskUserQuestionResultDetails {
 	mode: AskUserQuestionMode;
 	answers: AskAnswer[];
 	message?: string;
+	isSecret?: boolean;
 }
+
+const SECRET_CHANNEL = "ask-user-question:secret";
+const secrets: Map<string, string> = (globalThis as any).__piAskUserSecrets ??= new Map<string, string>();
 
 const RPC_PING_CHANNEL = "ask-user-question:rpc:ping";
 const RPC_ASK_CHANNEL = "ask-user-question:rpc:ask";
@@ -101,6 +105,12 @@ const AskUserQuestionParams = Type.Object({
 			description: "Set to true to allow multiple answers to be selected for a question.",
 		}),
 	),
+	secure: Type.Optional(
+		Type.Boolean({
+			description:
+				"Set to true to collect a secret, such as an API key or password. You never see the value; you get a handle such as {{secret:3f9a01bc}} that only secret-aware tools accept. Free text only: do not pass options.",
+		}),
+	),
 });
 
 type AskUserQuestionInput = Static<typeof AskUserQuestionParams>;
@@ -111,6 +121,7 @@ function isAskUserQuestionInput(value: unknown): value is AskUserQuestionInput {
 	if (typeof input.question !== "string" || input.question.trim().length === 0) return false;
 	if (input.details !== undefined && typeof input.details !== "string") return false;
 	if (input.multiSelect !== undefined && typeof input.multiSelect !== "boolean") return false;
+	if (input.secure !== undefined && typeof input.secure !== "boolean") return false;
 	if (input.options === undefined) return true;
 	if (!Array.isArray(input.options)) return false;
 	return input.options.every((option) => {
@@ -321,14 +332,39 @@ function buildResult(question: string, context: string | undefined, mode: AskUse
 	};
 }
 
+function secretResult(question: string, context: string | undefined, handle: string) {
+	return {
+		content: [{ type: "text" as const, text: `User entered a secret. You cannot see it. Its handle is ${handle}; pass the handle to a tool that accepts secret handles.` }],
+		details: { ...buildStructuredResult("answered", question, "text", [{ type: "text", label: handle, value: handle }], context), isSecret: true },
+	};
+}
+
+function redactSecrets(text: string): string {
+	let result = text;
+	const entries = [...secrets].filter(([, value]) => value.length >= 8).sort(([, a], [, b]) => b.length - a.length);
+	for (const [handle, value] of entries) result = result.split(value).join(handle);
+	return result;
+}
+
+function redactDeep<T>(value: T): T {
+	if (typeof value === "string") return redactSecrets(value) as T;
+	if (Array.isArray(value)) return value.map(redactDeep) as T;
+	if (value !== null && typeof value === "object") {
+		return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactDeep(item)])) as T;
+	}
+	return value;
+}
+
 async function askFreeText(
 	ctx: ExtensionContext,
 	question: string,
 	context: string | undefined,
 	signal: AbortSignal | undefined,
+	isSecure = false,
 ): Promise<string | undefined> {
 	if (ctx.mode === "rpc") {
-		return ctx.ui.editor(context ? `${question}\n\n${context}` : question, "");
+		const title = context ? `${question}\n\n${context}` : question;
+		return ctx.ui.editor(isSecure ? `Secret: the agent gets a handle, not the value.\n\n${title}` : title, "");
 	}
 
 	return ctx.ui.custom<string | undefined>((tui: any, theme: any, _kb: any, done: (result: string | undefined) => void) => {
@@ -345,6 +381,7 @@ async function askFreeText(
 
 		let cachedLines: string[] | undefined;
 		let cachedWidth = -1;
+		let isMasked = false;
 		const editor = new Editor(tui, createEditorTheme(theme));
 		editor.onSubmit = finish;
 
@@ -365,9 +402,12 @@ async function askFreeText(
 				addWrapped(lines, theme.fg("muted", ` ${context}`), width);
 			}
 			lines.push("");
-			for (const line of editor.render(Math.max(1, width - 2))) add(` ${line}`);
+			if (isSecure && isMasked) add(` ${theme.fg("text", "•".repeat(editor.getText().length))}`);
+			else for (const line of editor.render(Math.max(1, width - 2))) add(` ${line}`);
 			lines.push("");
-			add(theme.fg("dim", " Shift+Enter newline • Enter submit • Esc cancel"));
+			add(theme.fg("dim", isSecure
+				? ` Secret: the agent gets a handle, not the value • Ctrl+T ${isMasked ? "show" : "hide"} • Enter submit • Esc cancel`
+				: " Shift+Enter newline • Enter submit • Esc cancel"));
 			add(theme.fg("accent", "─".repeat(width)));
 			cachedLines = lines;
 			cachedWidth = width;
@@ -386,6 +426,11 @@ async function askFreeText(
 				}
 				if (matchesKey(data, Key.ctrl("v"))) {
 					void pasteClipboardIntoEditor(editor, () => !isDone, refresh);
+					return;
+				}
+				if (isSecure && matchesKey(data, Key.ctrl("t"))) {
+					isMasked = !isMasked;
+					refresh();
 					return;
 				}
 				editor.handleInput(data);
@@ -827,6 +872,9 @@ async function executeQuestion(
 	const context = params.details?.trim() || undefined;
 	const mode: AskUserQuestionMode = options.length === 0 ? "text" : params.multiSelect ? "multi-select" : "single-select";
 
+	if (params.secure && options.length > 0) {
+		return invalidResult(params.question, mode, "ask_user_question secure questions are free text: do not pass options", context);
+	}
 	if (params.question.trim().length === 0) {
 		return invalidResult(params.question, mode, "ask_user_question requires a non-blank question", context);
 	}
@@ -853,6 +901,14 @@ async function executeQuestion(
 		}
 		pi.events.emit("herdr:blocked", { active: true, label: params.question });
 		try {
+			if (mode === "text" && params.secure) {
+				const answer = (await askFreeText(ctx, params.question, context, signal, true))?.trim();
+				if (!answer) return cancelledResult(params.question, mode, context);
+				const handle = `{{secret:${randomBytes(4).toString("hex")}}}`;
+				secrets.set(handle, answer);
+				pi.events.emit(SECRET_CHANNEL, { handle, value: answer });
+				return secretResult(params.question, context, handle);
+			}
 			if (mode === "text") {
 				const answer = await askFreeText(ctx, params.question, context, signal);
 				if (answer === undefined) return cancelledResult(params.question, mode, context);
@@ -891,6 +947,23 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", () => {
 		activeContext = undefined;
+	});
+	pi.on("tool_result", (event) => {
+		if (secrets.size === 0) return;
+		try {
+			const original = { content: event.content, structuredContent: event.structuredContent, details: event.details };
+			const redacted = redactDeep(original);
+			if (JSON.stringify(redacted) === JSON.stringify(original)) return;
+			return { content: redacted.content, structuredContent: redacted.structuredContent, details: redacted.details ?? {} };
+		} catch {
+			return { content: [{ type: "text" as const, text: "pi-ask-user withheld this output because it could not remove a secret from it." }], structuredContent: undefined, details: {}, isError: true };
+		}
+	});
+	pi.on("context", (event) => {
+		if (secrets.size === 0) return;
+		const messages = redactDeep(event.messages);
+		if (JSON.stringify(messages) === JSON.stringify(event.messages)) return;
+		return { messages };
 	});
 	pi.events.on(RPC_PING_CHANNEL, (payload) => {
 		if (!isRpcOwner || payload === null || typeof payload !== "object") return;
