@@ -66,7 +66,7 @@ interface AskUserQuestionResultDetails {
 }
 
 const SECRET_CHANNEL = "ask-user-question:secret";
-const secrets = new Map<string, string>();
+const secrets: Map<string, string> = (globalThis as any).__piAskUserSecrets ??= new Map<string, string>();
 
 const RPC_PING_CHANNEL = "ask-user-question:rpc:ping";
 const RPC_ASK_CHANNEL = "ask-user-question:rpc:ask";
@@ -341,8 +341,18 @@ function secretResult(question: string, context: string | undefined, handle: str
 
 function redactSecrets(text: string): string {
 	let result = text;
-	for (const [handle, value] of secrets) if (value.length >= 8) result = result.split(value).join(handle);
+	const entries = [...secrets].filter(([, value]) => value.length >= 8).sort(([, a], [, b]) => b.length - a.length);
+	for (const [handle, value] of entries) result = result.split(value).join(handle);
 	return result;
+}
+
+function redactDeep<T>(value: T): T {
+	if (typeof value === "string") return redactSecrets(value) as T;
+	if (Array.isArray(value)) return value.map(redactDeep) as T;
+	if (value !== null && typeof value === "object") {
+		return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactDeep(item)])) as T;
+	}
+	return value;
 }
 
 async function askFreeText(
@@ -353,7 +363,8 @@ async function askFreeText(
 	isSecure = false,
 ): Promise<string | undefined> {
 	if (ctx.mode === "rpc") {
-		return ctx.ui.editor(context ? `${question}\n\n${context}` : question, "");
+		const title = context ? `${question}\n\n${context}` : question;
+		return ctx.ui.editor(isSecure ? `Secret: the agent gets a handle, not the value.\n\n${title}` : title, "");
 	}
 
 	return ctx.ui.custom<string | undefined>((tui: any, theme: any, _kb: any, done: (result: string | undefined) => void) => {
@@ -936,13 +947,23 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", () => {
 		activeContext = undefined;
-		secrets.clear();
 	});
 	pi.on("tool_result", (event) => {
 		if (secrets.size === 0) return;
-		const content = event.content.map((part) => part.type === "text" ? { ...part, text: redactSecrets(part.text) } : part);
-		const details = event.details === undefined ? undefined : JSON.parse(redactSecrets(JSON.stringify(event.details)));
-		return { content, details: details ?? {} };
+		try {
+			const original = { content: event.content, structuredContent: event.structuredContent, details: event.details };
+			const redacted = redactDeep(original);
+			if (JSON.stringify(redacted) === JSON.stringify(original)) return;
+			return { content: redacted.content, structuredContent: redacted.structuredContent, details: redacted.details ?? {} };
+		} catch {
+			return { content: [{ type: "text" as const, text: "pi-ask-user withheld this output because it could not remove a secret from it." }], structuredContent: undefined, details: {}, isError: true };
+		}
+	});
+	pi.on("context", (event) => {
+		if (secrets.size === 0) return;
+		const messages = redactDeep(event.messages);
+		if (JSON.stringify(messages) === JSON.stringify(event.messages)) return;
+		return { messages };
 	});
 	pi.events.on(RPC_PING_CHANNEL, (payload) => {
 		if (!isRpcOwner || payload === null || typeof payload !== "object") return;

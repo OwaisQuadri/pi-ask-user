@@ -757,12 +757,18 @@ test("a secure question returns a handle, never the value, and redacts the value
 		const handle = settled.details.answers[0].value;
 		assert.match(handle, /^\{\{secret:[0-9a-f]{8}\}\}$/);
 		assert.deepEqual(picker.emitted.find((event) => event.channel === "ask-user-question:secret")?.payload, { handle, value: "sk-or-v1-0123456789abcdef" });
-		const redacted = (picker.lifecycleHandlers.get("tool_result") as any)({
+		const toolResult = picker.lifecycleHandlers.get("tool_result") as any;
+		const redacted = toolResult({
 			content: [{ type: "text", text: "echo sk-or-v1-0123456789abcdef" }],
+			structuredContent: { output: "sk-or-v1-0123456789abcdef\\" },
 			details: { stdout: "sk-or-v1-0123456789abcdef" },
 		});
 		assert.equal(redacted.content[0].text, `echo ${handle}`);
+		assert.deepEqual(redacted.structuredContent, { output: `${handle}\\` });
 		assert.deepEqual(redacted.details, { stdout: handle });
+		assert.equal(toolResult({ content: [{ type: "text", text: "clean" }], structuredContent: { ok: true } }), undefined);
+		const context = (picker.lifecycleHandlers.get("context") as any)({ messages: [{ role: "user", content: "key sk-or-v1-0123456789abcdef" }] });
+		assert.deepEqual(context.messages, [{ role: "user", content: `key ${handle}` }]);
 		const invalid = await picker.tool.execute("secret-options", { question: "Key?", secure: true, options: [{ label: "A" }, { label: "B" }] }, undefined, undefined, picker.ctx);
 		assert.equal(invalid.details.status, "invalid");
 	} finally {
