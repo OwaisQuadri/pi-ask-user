@@ -17,6 +17,7 @@ export class Text { constructor(text) { this.text = text; } }
 export class Editor {
 	constructor() { this.text = ""; this.onSubmit = undefined; }
 	setText(text) { this.text = text; }
+	getText() { return this.text; }
 	insertTextAtCursor(text) { this.text += text; globalThis.__askLastInsertion = text; }
 	handleInput(data) {
 		if (data === "ENTER") { this.onSubmit?.(this.text); return; }
@@ -736,6 +737,34 @@ test("serves the same question result over the in-process RPC", async () => {
 		}
 		assert.equal((replies[0] as any).success, true);
 		assert.equal((replies[0] as any).data.details.answers[0].value, "free text");
+	} finally {
+		await picker.dispose();
+	}
+});
+
+test("a secure question returns a handle, never the value, and redacts the value from later tool results", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		const pending = picker.tool.execute("secret", { question: "OpenRouter key?", secure: true }, undefined, undefined, picker.ctx);
+		const component = await waitForComponent(picker.component);
+		component.handleInput("sk-or-v1-0123456789abcdef");
+		component.handleInput("CTRL_t");
+		assert.ok(component.render(80).some((line: string) => line.includes("•".repeat(25))));
+		component.handleInput("ENTER");
+		const settled = await pending;
+		const serialized = JSON.stringify(settled);
+		assert.ok(!serialized.includes("sk-or-v1-0123456789abcdef"));
+		const handle = settled.details.answers[0].value;
+		assert.match(handle, /^\{\{secret:[0-9a-f]{8}\}\}$/);
+		assert.deepEqual(picker.emitted.find((event) => event.channel === "ask-user-question:secret")?.payload, { handle, value: "sk-or-v1-0123456789abcdef" });
+		const redacted = (picker.lifecycleHandlers.get("tool_result") as any)({
+			content: [{ type: "text", text: "echo sk-or-v1-0123456789abcdef" }],
+			details: { stdout: "sk-or-v1-0123456789abcdef" },
+		});
+		assert.equal(redacted.content[0].text, `echo ${handle}`);
+		assert.deepEqual(redacted.details, { stdout: handle });
+		const invalid = await picker.tool.execute("secret-options", { question: "Key?", secure: true, options: [{ label: "A" }, { label: "B" }] }, undefined, undefined, picker.ctx);
+		assert.equal(invalid.details.status, "invalid");
 	} finally {
 		await picker.dispose();
 	}
