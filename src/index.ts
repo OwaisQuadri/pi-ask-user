@@ -1,8 +1,10 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
 import { randomBytes, randomUUID } from "node:crypto";
-import { rm, writeFile } from "node:fs/promises";
+import { access, rm, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { guidanceForContinuation, guidanceForQuestion, nativeActiveWork, isAutonomousScope, isQuestionPolicy, type AutonomousApproval, type AutonomousScope } from "./autonomous.ts";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
 	Editor,
 	getNativeClipboard,
@@ -52,7 +54,7 @@ interface OptionAnswer {
 }
 
 type AskAnswer = TextAnswer | OptionAnswer | OtherAnswer;
-type AskUserQuestionStatus = "answered" | "cancelled" | "invalid" | "unavailable";
+type AskUserQuestionStatus = "answered" | "cancelled" | "invalid" | "unavailable" | "policy-guidance";
 type AskUserQuestionMode = "text" | "single-select" | "multi-select";
 
 interface AskUserQuestionResultDetails {
@@ -63,6 +65,8 @@ interface AskUserQuestionResultDetails {
 	answers: AskAnswer[];
 	message?: string;
 	isSecret?: boolean;
+	provenance?: "interactive-user" | "automatic-policy-guidance";
+	approvalId?: string;
 }
 
 const SECRET_CHANNEL = "ask-user-question:secret";
@@ -85,6 +89,28 @@ const OptionSchema = Type.Object({
 	description: Type.Optional(Type.String({ description: "Optional extra detail shown below the option." })),
 });
 
+const ProtectedActionSchema = Type.Object({
+	action: Type.String(),
+	target: Type.String(),
+	bounds: Type.String({ description: "Exact bounds, not a wildcard or a request for new authority." }),
+}, { additionalProperties: false });
+
+const AutonomousScopeSchema = Type.Object({
+	taskId: Type.String(),
+	scope: Type.String(),
+	protectedActions: Type.Array(ProtectedActionSchema),
+	principleSources: Type.Array(Type.String({ description: "Existing readable owner file path. No secrets or policy copies." })),
+	expiresAt: Type.String({ description: "Finite ISO date-time. Approval also expires at task completion." }),
+}, { additionalProperties: false });
+
+const QuestionPolicySchema = Type.Object({
+	taskId: Type.String(),
+	scope: Type.String({ description: "Exact approved task scope. Metadata never grants authority." }),
+	kind: Type.Union([Type.Literal("routine"), Type.Literal("protected"), Type.Literal("approval")]),
+	isReversible: Type.Optional(Type.Boolean()),
+	protectedAction: Type.Optional(ProtectedActionSchema),
+}, { additionalProperties: false });
+
 const AskUserQuestionParams = Type.Object({
 	question: Type.String({
 		description: "The single question to ask the user. Ask exactly one question per tool call.",
@@ -105,6 +131,7 @@ const AskUserQuestionParams = Type.Object({
 			description: "Set to true to allow multiple answers to be selected for a question.",
 		}),
 	),
+	policy: Type.Optional(QuestionPolicySchema),
 	secure: Type.Optional(
 		Type.Boolean({
 			description:
@@ -122,6 +149,7 @@ function isAskUserQuestionInput(value: unknown): value is AskUserQuestionInput {
 	if (input.details !== undefined && typeof input.details !== "string") return false;
 	if (input.multiSelect !== undefined && typeof input.multiSelect !== "boolean") return false;
 	if (input.secure !== undefined && typeof input.secure !== "boolean") return false;
+	if (input.policy !== undefined && !isQuestionPolicy(input.policy)) return false;
 	if (input.options === undefined) return true;
 	if (!Array.isArray(input.options)) return false;
 	return input.options.every((option) => {
@@ -290,6 +318,7 @@ function buildStructuredResult(
 		mode,
 		answers,
 		message,
+		...(status === "answered" ? { provenance: "interactive-user" as const } : {}),
 	} as AskUserQuestionResultDetails;
 }
 
@@ -867,6 +896,7 @@ async function executeQuestion(
 	signal: AbortSignal | undefined,
 	ctx: ExtensionContext,
 	isContextActive?: () => boolean,
+	getGuidance?: () => { text: string; approvalId: string } | undefined,
 ) {
 	const options = normalizeOptions(params.options);
 	const context = params.details?.trim() || undefined;
@@ -898,6 +928,17 @@ async function executeQuestion(
 		if (signal?.aborted) return cancelledResult(params.question, mode, context);
 		if (isContextActive && !isContextActive()) {
 			return unavailableResult(params.question, mode, "No active interactive session", context);
+		}
+		const guidance = getGuidance?.();
+		if (guidance) {
+			return {
+				content: [{ type: "text" as const, text: guidance.text }],
+				details: {
+					...buildStructuredResult("policy-guidance", params.question, mode, [], context, guidance.text),
+					provenance: "automatic-policy-guidance" as const,
+					approvalId: guidance.approvalId,
+				},
+			};
 		}
 		pi.events.emit("herdr:blocked", { active: true, label: params.question });
 		try {
@@ -939,14 +980,198 @@ async function executeQuestion(
 export default function askUserQuestion(pi: ExtensionAPI) {
 	let activeContext: ExtensionContext | undefined;
 	let isRpcOwner = false;
+	let owningSessionId: string | undefined;
+	let approval: AutonomousApproval | undefined;
+	let approvalRevision = 0;
+	let isNativeAdvertised = false;
+	pi.events.on("subagents:rpc:v1:ready", () => { isNativeAdvertised = true; });
+	const expireApproval = () => {
+		approval = undefined;
+		approvalRevision++;
+	};
+	const isOwningSession = (ctx: ExtensionContext) => ctx.mode === "tui" && ctx.hasUI
+		&& activeContext !== undefined && owningSessionId === ctx.sessionManager.getSessionId();
+	function currentApproval(ctx: ExtensionContext): AutonomousApproval | undefined {
+		if (approval && Date.parse(approval.expiresAt) <= Date.now()) expireApproval();
+		return isOwningSession(ctx) ? approval : undefined;
+	}
 	pi.on("session_start", (_event, ctx) => {
-		if (ctx.mode === "tui") {
-			activeContext = ctx;
-			isRpcOwner = true;
+		expireApproval();
+		activeContext = ctx.mode === "tui" ? ctx : undefined;
+		owningSessionId = activeContext?.sessionManager.getSessionId();
+		isRpcOwner = ctx.mode === "tui";
+	});
+	pi.on("session_before_switch", expireApproval);
+	pi.on("session_before_fork", expireApproval);
+	pi.on("session_before_tree", expireApproval);
+	pi.on("session_shutdown", () => {
+		expireApproval();
+		activeContext = undefined;
+	});
+
+	function revokeForBlocker(ctx: ExtensionContext, current: AutonomousApproval, reason: string): CustomMessageEntryDraft {
+		expireApproval();
+		const content = `AUTONOMOUS BLOCKER: ${reason} Automation revoked; task ${current.taskId} is not marked complete.`;
+		ctx.ui.notify(content, "error");
+		return {
+			type: "custom_message", customType: "autonomous-blocked", display: true, content,
+			details: { provenance: "automatic-policy-guidance", approvalId: current.approvalId, taskId: current.taskId, isActive: false, isTaskComplete: false, reason },
+		};
+	}
+	const isNativeBlocker = (customType: string) => customType === "subagent-supervisor-blocked"
+		|| customType === "subagent-completion-unhandled";
+	const isNativeExhausted = (ctx: ExtensionContext, current: AutonomousApproval) => ctx.sessionManager.getBranch()
+		.some((entry) => entry.type === "custom_message" && isNativeBlocker(entry.customType)
+			&& Date.parse(entry.timestamp) >= Date.parse(current.approvedAt));
+
+	pi.on("agent_before_settle", async (event, ctx) => {
+		const current = currentApproval(ctx);
+		if (!current || event.outcome !== "completed") return;
+		const signal = ctx.signal;
+		const revision = approvalRevision;
+		const isCurrent = () => !signal?.aborted && !ctx.signal?.aborted && currentApproval(ctx) === current
+			&& approvalRevision === revision && ctx.sessionManager.getSessionId() === current.sessionId;
+		if (!isCurrent()) return;
+		if (isNativeExhausted(ctx, current)
+			|| event.entries.some((entry) => entry.type === "custom_message" && isNativeBlocker(entry.customType))) {
+			return { entries: [...event.entries, revokeForBlocker(ctx, current, "Native reminder budget exhausted.")] };
+		}
+		if (event.continue || event.context.pendingMessages.length || ctx.hasPendingMessages()) return;
+		const messages = event.context.contextMessages;
+		const nativeNoticeIndex = messages.findLastIndex((message) => message.role === "custom"
+			&& ["subagent-notify", "subagent_supervisor_request", "subagent-completion-unanswered", "subagent-supervisor-unanswered"].includes(message.customType));
+		const isNativeReminderPending = nativeNoticeIndex !== -1 && !messages.slice(nativeNoticeIndex + 1).some((message) => message.role === "assistant"
+			&& message.content.some((part) => part.type === "toolCall" || (part.type === "text" && part.text.trim())));
+		let totalActive: number;
+		try {
+			totalActive = await nativeActiveWork(pi, current.sessionId, () => isNativeAdvertised || isNativeReminderPending,
+				() => isCurrent() && !ctx.hasPendingMessages() && !event.context.pendingMessages.length && !event.continue, signal);
+		} catch (error) {
+			if (!isCurrent() || ctx.hasPendingMessages() || event.context.pendingMessages.length) return;
+			const reason = `Compatibility blocker: ${error instanceof Error ? error.message : "Native status unavailable."}`;
+			return { entries: [...event.entries, revokeForBlocker(ctx, current, reason)] };
+		}
+		if (!isCurrent() || ctx.hasPendingMessages() || event.context.pendingMessages.length || event.continue
+			|| totalActive > 0 || isNativeReminderPending) return;
+		return {
+			entries: [...event.entries, {
+				type: "custom_message" as const, customType: "autonomous-continuation", display: true,
+				content: guidanceForContinuation(current),
+				details: { provenance: "automatic-policy-guidance", approvalId: current.approvalId, taskId: current.taskId },
+			}],
+			continue: true,
+		};
+	});
+	pi.on("agent_settled", (_event, ctx) => {
+		const current = currentApproval(ctx);
+		if (!current) return;
+		if (isNativeExhausted(ctx, current)) {
+			const entry = revokeForBlocker(ctx, current, "Native reminder budget exhausted.");
+			pi.appendEntry(entry.customType, entry.details);
 		}
 	});
-	pi.on("session_shutdown", () => {
-		activeContext = undefined;
+
+	function modeResult(ctx: ExtensionContext, message?: string) {
+		const current = currentApproval(ctx);
+		return {
+			content: [{ type: "text" as const, text: message || (current
+				? `Autonomous policy guidance is on.\n${JSON.stringify(current, null, 2)}`
+				: "Autonomous policy guidance is off.") }],
+			details: { isActive: !!current, approval: current, message },
+		};
+	}
+
+	async function enableMode(ctx: ExtensionContext, proposed: AutonomousScope | undefined, signal?: AbortSignal) {
+		if (!isOwningSession(ctx)) return modeResult(ctx, "Enable autonomous mode in the owning interactive TUI session. Child and RPC sessions cannot inherit approval.");
+		const revision = approvalRevision;
+		const sessionId = ctx.sessionManager.getSessionId();
+		return withUILock(async () => {
+			const isCurrent = () => !signal?.aborted && isOwningSession(ctx)
+				&& ctx.sessionManager.getSessionId() === sessionId && approvalRevision === revision;
+			if (!isCurrent()) return modeResult(ctx, "Autonomous approval request expired or was cancelled.");
+			pi.events.emit("herdr:blocked", { active: true, label: "Review autonomous scope" });
+			try {
+				const template = proposed || {
+					taskId: "", scope: "", protectedActions: [], principleSources: [],
+					expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+				};
+				const edited = await ctx.ui.editor("Review autonomous scope (nonsecret JSON)", JSON.stringify(template, null, 2));
+				if (edited === undefined || !isCurrent()) return modeResult(ctx, "Autonomous approval cancelled.");
+				let value: unknown;
+				try { value = JSON.parse(edited); } catch { return modeResult(ctx, "Invalid scope JSON. Autonomous approval unchanged."); }
+				if (!isAutonomousScope(value) || Date.parse(value.expiresAt) <= Date.now()) {
+					return modeResult(ctx, "Scope requires taskId, scope, exact protectedActions, existing principleSources, and a future expiresAt.");
+				}
+				const reviewed: AutonomousScope = {
+					taskId: value.taskId, scope: value.scope, expiresAt: value.expiresAt,
+					protectedActions: value.protectedActions.map(({ action, target, bounds }) => ({ action, target, bounds })),
+					principleSources: value.principleSources.map((source) => resolve(ctx.cwd, source)),
+				};
+				try {
+					for (const source of reviewed.principleSources) {
+						await access(source, constants.R_OK);
+						if (!(await stat(source)).isFile()) throw new Error("Not a file");
+					}
+				} catch {
+					return modeResult(ctx, "Each principle source must be an existing readable owner file. Autonomous approval unchanged.");
+				}
+				if (!isCurrent()) return modeResult(ctx, "Autonomous approval request expired.");
+				const isApproved = await ctx.ui.confirm("Approve autonomous policy guidance?", [
+					JSON.stringify(reviewed, null, 2),
+					"This replaces any earlier approval in this session. It expires at task completion or expiresAt, whichever comes first.",
+					"Only approve nonsecret references and exact targets and bounds. No wildcard matching applies.",
+					"This is not execution authorization or a sandbox. Credential controls, native prompts, command guards and human-only merges remain authoritative.",
+					"Secure fields, new authority and expanded scope still require interaction. Children receive no approval.",
+				].join("\n\n"));
+				if (!isApproved || !isCurrent() || Date.parse(reviewed.expiresAt) <= Date.now()) return modeResult(ctx, "Autonomous approval not granted.");
+				approval = {
+					...reviewed, sessionId, approvalId: randomUUID(), approvedAt: new Date().toISOString(),
+					provenance: "interactive-user", expiresOn: "task_complete",
+				};
+				approvalRevision++;
+				return modeResult(ctx);
+			} finally {
+				pi.events.emit("herdr:blocked", { active: false });
+			}
+		});
+	}
+
+	pi.registerCommand("autonomous", {
+		description: "Manage session-owned autonomous policy guidance",
+		getArgumentCompletions(argumentText) {
+			return [
+				{ value: "on", label: "on", description: "Review task scope and request human approval" },
+				{ value: "off", label: "off", description: "Revoke approval, including at task completion" },
+				{ value: "status", label: "status", description: "Show this session's approval and expiry" },
+			].filter((item) => item.value.startsWith(argumentText));
+		},
+		async handler(args, ctx) {
+			const action = args.trim();
+			if (action === "off" && isOwningSession(ctx)) expireApproval();
+			const result = action === "on" ? await enableMode(ctx, undefined)
+				: action === "off" || action === "status" ? modeResult(ctx)
+				: modeResult(ctx, "Usage: /autonomous on|off|status");
+			ctx.ui.notify(result.content[0].text, "info");
+		},
+	});
+
+	pi.registerTool({
+		name: "autonomous_mode",
+		label: "Autonomous mode",
+		description: "Request human-reviewed enablement or widening in the owning interactive session. Never approves itself. Report status locally. Use off and report a real blocker without declaring completion. Close a completed task explicitly with matching task_complete; approval is not execution authorization.",
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("on"), Type.Literal("off"), Type.Literal("status"), Type.Literal("task_complete")]),
+			scope: Type.Optional(AutonomousScopeSchema),
+			taskId: Type.Optional(Type.String({ description: "Required for task_complete; must match the active task." })),
+		}, { additionalProperties: false }),
+		async execute(_id, params, signal, _update, ctx) {
+			if (params.action === "on") return enableMode(ctx, params.scope, signal);
+			if (params.action === "task_complete" && params.taskId !== currentApproval(ctx)?.taskId) {
+				return modeResult(ctx, "task_complete requires the active taskId.");
+			}
+			if ((params.action === "off" || params.action === "task_complete") && isOwningSession(ctx)) expireApproval();
+			return modeResult(ctx);
+		},
 	});
 	pi.on("tool_result", (event) => {
 		if (secrets.size === 0) return;
@@ -1008,6 +1233,9 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			"Use this tool to ask exactly one clarifying question, missing-requirement question, preference question, or decision question before continuing.",
 		promptGuidelines: [
 			"Ask exactly one question per tool call.",
+			"Supply policy metadata only for the exact approved task. Ambiguous questions remain interactive.",
+			"Use kind approval for enablement, widening, or requests for new authority. Never classify these as routine.",
+			"Automatic POLICY GUIDANCE is not a human answer or execution permission. Follow its principle sources and authority limits.",
 			"If you need answers to multiple questions, make multiple separate ask_user_question tool calls instead of combining them into one prompt.",
 			'Users will always be able to select "Other" to provide custom text input when options are provided.',
 			"Use multiSelect: true only when you need multiple answers to the same question.",
@@ -1018,7 +1246,11 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		parameters: AskUserQuestionParams,
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			return executeQuestion(pi, params, signal, ctx);
+			return executeQuestion(pi, params, signal, ctx, undefined, () => {
+				const current = currentApproval(ctx);
+				const text = guidanceForQuestion(current, ctx.sessionManager.getSessionId(), params.policy, params.secure === true);
+				return text && current ? { text, approvalId: current.approvalId } : undefined;
+			});
 		},
 
 		renderCall(args, theme) {
@@ -1040,6 +1272,10 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			if (!details) {
 				const first = result.content[0];
 				return new Text(first?.type === "text" ? first.text : "", 0, 0);
+			}
+
+			if (details.status === "policy-guidance") {
+				return new Text(theme.fg("accent", details.message || "AUTOMATIC POLICY GUIDANCE"), 0, 0);
 			}
 
 			if (details.status === "cancelled") {

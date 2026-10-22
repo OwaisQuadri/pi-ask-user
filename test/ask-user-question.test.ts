@@ -36,6 +36,8 @@ export const Type = {
 	Optional: (value) => value,
 	Array: (value) => value,
 	Boolean: (value) => value,
+	Union: (value) => value,
+	Literal: (value) => value,
 };
 `;
 
@@ -49,6 +51,7 @@ async function writeModule(root: string, name: string, source: string): Promise<
 async function loadPicker(mode = "rpc") {
 	const root = await mkdtemp(join(tmpdir(), "ask-user-question-"));
 	await writeFile(join(root, "ask-user-question.ts"), await readFile(extensionPath));
+	await writeFile(join(root, "autonomous.ts"), await readFile(new URL("../src/autonomous.ts", import.meta.url)));
 	await writeModule(root, "@earendil-works/pi-tui", tuiModule);
 	await writeModule(root, "typebox", typeboxModule);
 	await writeModule(root, "@earendil-works/pi-coding-agent", "");
@@ -57,11 +60,16 @@ async function loadPicker(mode = "rpc") {
 	const lifecycleHandlers = new Map<string, (event: unknown, context: unknown) => void>();
 	const emitted: Array<{ channel: string; payload: unknown }> = [];
 	let tool: any;
+	const tools = new Map<string, any>();
+	const commands = new Map<string, any>();
 	let component: any;
 	let customCallCount = 0;
 	const editorCalls: Array<{ title: string; prefill: string | undefined }> = [];
 	let resolveEditor: ((value: string | undefined) => void) | undefined;
+	const confirmCalls: Array<{ title: string; message: string }> = [];
+	let resolveConfirm: ((isApproved: boolean) => void) | undefined;
 	const notices: string[] = [];
+	const branch: any[] = [];
 	const theme = {
 		fg(_name: string, text: string) {
 			return text;
@@ -73,8 +81,15 @@ async function loadPicker(mode = "rpc") {
 	const ctx = {
 		hasUI: true,
 		mode,
-		sessionManager: { getSessionId: () => "session-1" },
+		cwd: root,
+		signal: undefined as AbortSignal | undefined,
+		hasPendingMessages: () => false,
+		sessionManager: { getSessionId: () => "session-1", getBranch: () => branch },
 		ui: {
+			confirm(title: string, message: string) {
+				confirmCalls.push({ title, message });
+				return new Promise<boolean>((resolve) => { resolveConfirm = resolve; });
+			},
 			notify(message: string) {
 				notices.push(message);
 			},
@@ -93,8 +108,14 @@ async function loadPicker(mode = "rpc") {
 		},
 	};
 	const api = {
-		registerTool(value: unknown) {
-			tool = value;
+		getAllTools: () => [...tools.values()],
+		appendEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
+		registerTool(value: any) {
+			tools.set(value.name, value);
+			if (value.name === "ask_user_question") tool = value;
+		},
+		registerCommand(name: string, value: any) {
+			commands.set(name, value);
 		},
 		on(event: string, handler: (event: unknown, context: unknown) => void) {
 			lifecycleHandlers.set(event, handler);
@@ -116,10 +137,15 @@ async function loadPicker(mode = "rpc") {
 	lifecycleHandlers.get("session_start")?.({}, ctx);
 	return {
 		tool,
+		tools,
+		commands,
+		confirmCalls,
+		resolveConfirm: (isApproved: boolean) => resolveConfirm?.(isApproved),
 		ctx,
 		api,
 		emitted,
 		lifecycleHandlers,
+		branch,
 		notices,
 		component: () => component,
 		customCallCount: () => customCallCount,
@@ -773,5 +799,341 @@ test("a secure question returns a handle, never the value, and redacts the value
 		assert.equal(invalid.details.status, "invalid");
 	} finally {
 		await picker.dispose();
+	}
+});
+
+function autonomousScope() {
+	return {
+		taskId: "picker-task", scope: "Update the picker", protectedActions: [],
+		principleSources: ["ask-user-question.ts"], expiresAt: new Date(Date.now() + 60_000).toISOString(),
+	};
+}
+
+async function approveMode(picker: Awaited<ReturnType<typeof loadPicker>>, scope = autonomousScope()) {
+	const editorCount = picker.editorCalls.length;
+	const confirmCount = picker.confirmCalls.length;
+	const pending = picker.tools.get("autonomous_mode").execute("enable", { action: "on", scope }, undefined, undefined, picker.ctx);
+	await waitForComponent(() => picker.editorCalls.length > editorCount ? picker.editorCalls : undefined);
+	picker.resolveEditor(JSON.stringify(scope));
+	await waitForComponent(() => picker.confirmCalls.length > confirmCount ? picker.confirmCalls : undefined);
+	assert.match(picker.confirmCalls.at(-1)!.message, /not execution authorization/);
+	picker.resolveConfirm(true);
+	return pending;
+}
+
+test("autonomous enablement and widening require human confirmation, not proposed approval text", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		const scope = autonomousScope();
+		const mode = picker.tools.get("autonomous_mode");
+		const pending = mode.execute("enable", { action: "on", scope: { ...scope, isApproved: true } }, undefined, undefined, picker.ctx);
+		await waitForComponent(() => picker.editorCalls[0]);
+		assert.equal((await mode.execute("status", { action: "status" }, undefined, undefined, picker.ctx)).details.isActive, false);
+		picker.resolveEditor(JSON.stringify(scope));
+		await waitForComponent(() => picker.confirmCalls[0]);
+		picker.resolveConfirm(false);
+		assert.equal((await pending).details.isActive, false);
+		const approved = await approveMode(picker, scope);
+		assert.equal(approved.details.approval.provenance, "interactive-user");
+		assert.equal(approved.details.approval.expiresOn, "task_complete");
+		const wider = { ...scope, scope: "Update everything" };
+		const widening = mode.execute("widen", { action: "on", scope: wider }, undefined, undefined, picker.ctx);
+		await waitForComponent(() => picker.editorCalls.length === 3 ? true : undefined);
+		picker.resolveEditor(JSON.stringify(wider));
+		await waitForComponent(() => picker.confirmCalls.length === 3 ? true : undefined);
+		picker.resolveConfirm(false);
+		assert.equal((await widening).details.approval.approvalId, approved.details.approval.approvalId);
+	} finally { await picker.dispose(); }
+});
+
+test("autonomous guidance has provenance and no answers while secure, ambiguous and child RPC questions remain human", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		const scope = autonomousScope();
+		const approved = await approveMode(picker, scope);
+		const policy = { taskId: scope.taskId, scope: scope.scope, kind: "routine", isReversible: true };
+		const result = await picker.tool.execute("routine", {
+			question: "Choose an implementation?", policy, options: [{ label: "A" }, { label: "B" }],
+		}, undefined, undefined, picker.ctx);
+		assert.equal(result.details.status, "policy-guidance");
+		assert.equal(result.details.provenance, "automatic-policy-guidance");
+		assert.equal(result.details.approvalId, approved.details.approval.approvalId);
+		assert.deepEqual(result.details.answers, []);
+		assert.equal(picker.customCallCount(), 0);
+		assert.match(picker.tool.renderResult(result, {}, { fg: (_name: string, text: string) => text }).text, /AUTOMATIC POLICY GUIDANCE/);
+		for (const params of [{ question: "Unclassified?" }, { question: "Secret?", policy, secure: true }]) {
+			const oldComponent = picker.component();
+			const pending = picker.tool.execute("interactive", params, undefined, undefined, picker.ctx);
+			const component = await waitForComponent(() => picker.component() !== oldComponent ? picker.component() : undefined);
+			component.handleInput("human-input-value");
+			component.handleInput("ENTER");
+			assert.equal((await pending).details.provenance, "interactive-user");
+		}
+		const oldComponent = picker.component();
+		const replies: any[] = [];
+		picker.api.events.on("ask-user-question:rpc:ask:reply:child", (payload) => replies.push(payload));
+		picker.api.events.emit("ask-user-question:rpc:ask", { requestId: "child", params: { question: "Child?", policy } });
+		const component = await waitForComponent(() => picker.component() !== oldComponent ? picker.component() : undefined);
+		component.handleInput("ENTER");
+		await waitForComponent(() => replies[0]);
+		assert.equal(replies[0].data.details.provenance, "interactive-user");
+		assert.equal(replies[0].data.details.approvalId, undefined);
+	} finally { await picker.dispose(); }
+});
+
+test("autonomous approval cannot survive task completion, lifecycle changes or pending confirmation revocation", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		const mode = picker.tools.get("autonomous_mode");
+		await approveMode(picker);
+		const mismatch = await mode.execute("complete-other", { action: "task_complete", taskId: "other" }, undefined, undefined, picker.ctx);
+		assert.equal(mismatch.details.isActive, true);
+		const complete = await mode.execute("complete", { action: "task_complete", taskId: "picker-task" }, undefined, undefined, picker.ctx);
+		assert.equal(complete.details.isActive, false);
+		for (const event of ["session_before_fork", "session_before_switch", "session_before_tree", "session_shutdown", "session_start"]) {
+			picker.lifecycleHandlers.get("session_start")?.({}, picker.ctx);
+			await approveMode(picker);
+			picker.lifecycleHandlers.get(event)?.({}, picker.ctx);
+			assert.equal((await mode.execute("status", { action: "status" }, undefined, undefined, picker.ctx)).details.isActive, false);
+		}
+		const count = picker.confirmCalls.length;
+		const pending = mode.execute("late", { action: "on", scope: autonomousScope() }, undefined, undefined, picker.ctx);
+		await waitForComponent(() => picker.editorCalls.length > count ? true : undefined);
+		picker.resolveEditor(JSON.stringify(autonomousScope()));
+		await waitForComponent(() => picker.confirmCalls.length > count ? true : undefined);
+		await mode.execute("off", { action: "off" }, undefined, undefined, picker.ctx);
+		picker.resolveConfirm(true);
+		assert.equal((await pending).details.isActive, false);
+	} finally { await picker.dispose(); }
+});
+
+test("autonomous command approval refuses expired scopes and unreadable sources before confirmation", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		const command = picker.commands.get("autonomous");
+		for (const scope of [
+			{ ...autonomousScope(), expiresAt: "2000-01-01T00:00:00Z" },
+			{ ...autonomousScope(), principleSources: ["missing-owner-file.md"] },
+		]) {
+			const count = picker.editorCalls.length;
+			const pending = command.handler("on", picker.ctx);
+			await waitForComponent(() => picker.editorCalls.length > count ? true : undefined);
+			picker.resolveEditor(JSON.stringify(scope));
+			await pending;
+			assert.equal(picker.confirmCalls.length, 0);
+		}
+		const count = picker.editorCalls.length;
+		const pending = command.handler("on", picker.ctx);
+		await waitForComponent(() => picker.editorCalls.length > count ? true : undefined);
+		picker.resolveEditor(JSON.stringify(autonomousScope()));
+		await waitForComponent(() => picker.confirmCalls[0]);
+		picker.resolveConfirm(true);
+		await pending;
+		await command.handler("status", picker.ctx);
+		assert.match(picker.notices.at(-1)!, /Autonomous policy guidance is on/);
+		await command.handler("off", picker.ctx);
+		assert.equal(picker.notices.at(-1), "Autonomous policy guidance is off.");
+	} finally { await picker.dispose(); }
+});
+
+test("autonomous commands complete subcommands and child instances cannot enable mode", async () => {
+	const picker = await loadPicker("rpc");
+	try {
+		const command = picker.commands.get("autonomous");
+		assert.deepEqual(command.getArgumentCompletions("").map((item: any) => item.value), ["on", "off", "status"]);
+		assert.deepEqual(command.getArgumentCompletions("st").map((item: any) => item.value), ["status"]);
+		const result = await picker.tools.get("autonomous_mode").execute("child", { action: "on", scope: autonomousScope() }, undefined, undefined, picker.ctx);
+		assert.equal(result.details.isActive, false);
+		assert.equal(picker.editorCalls.length, 0);
+		assert.equal(picker.confirmCalls.length, 0);
+	} finally { await picker.dispose(); }
+});
+
+function settleEvent() {
+	return {
+		type: "agent_before_settle", outcome: "completed", continue: false, entries: [] as any[],
+		context: { canContinue: false, pendingMessages: [] as any[], contextMessages: [] as any[] },
+	};
+}
+
+function nativeReply(picker: Awaited<ReturnType<typeof loadPicker>>, request: any, data: unknown) {
+	picker.api.events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+		version: 1, requestId: request.requestId, method: request.method, success: true, data,
+	});
+}
+
+function nativePing() {
+	return { version: 1, methods: ["ping", "status"], session: { sessionId: "session-1" }, capabilities: { status: true, fleetStatus: { version: 1 } } };
+}
+
+function configureNative(picker: Awaited<ReturnType<typeof loadPicker>>, totalActive = 0, omitted = totalActive) {
+	picker.tools.set("subagent", { name: "subagent" });
+	picker.api.events.on("subagents:rpc:v1:request", (raw) => {
+		const request = raw as any;
+		nativeReply(picker, request, request.method === "ping" ? nativePing()
+			: { fleet: { version: 1, entries: [], totalActive, omitted } });
+	});
+}
+
+function settle(picker: Awaited<ReturnType<typeof loadPicker>>, event = settleEvent()) {
+	return (picker.lifecycleHandlers.get("agent_before_settle") as any)(event, picker.ctx);
+}
+
+async function modeStatus(picker: Awaited<ReturnType<typeof loadPicker>>) {
+	return picker.tools.get("autonomous_mode").execute("status", { action: "status" }, undefined, undefined, picker.ctx);
+}
+
+test("an open autonomous task continues after a final answer until matching task_complete", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		configureNative(picker);
+		const approved = await approveMode(picker);
+		const event = settleEvent();
+		event.entries.push({ type: "custom", customType: "prior-draft", data: {} });
+		const result = await settle(picker, event);
+		assert.equal(result.continue, true);
+		assert.equal(event.context.canContinue, false);
+		assert.equal(result.entries[0], event.entries[0]);
+		assert.equal(result.entries.length, 2);
+		assert.equal(result.entries[1].type, "custom_message");
+		assert.equal(result.entries[1].details.approvalId, approved.details.approval.approvalId);
+		assert.equal(result.entries[1].details.provenance, "automatic-policy-guidance");
+		assert.match(result.entries[1].content, /AUTOMATIC POLICY GUIDANCE/);
+		assert.equal((await modeStatus(picker)).details.isActive, true);
+		const mode = picker.tools.get("autonomous_mode");
+		await mode.execute("mismatch", { action: "task_complete", taskId: "other" }, undefined, undefined, picker.ctx);
+		assert.equal((await settle(picker)).continue, true);
+		await mode.execute("complete", { action: "task_complete", taskId: "picker-task" }, undefined, undefined, picker.ctx);
+		assert.equal(await settle(picker), undefined);
+	} finally { await picker.dispose(); }
+});
+
+test("live native jobs including omitted entries permit waiting without another wake owner", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		configureNative(picker, 5, 5);
+		await approveMode(picker);
+		assert.equal(await settle(picker), undefined);
+		assert.equal((await modeStatus(picker)).details.isActive, true);
+		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "subagents:rpc:v1:request").map(({ payload }) => (payload as any).method), ["ping", "status"]);
+		assert.equal(picker.emitted.some(({ channel }) => /complete|wake|bg_wait/.test(channel)), false);
+	} finally { await picker.dispose(); }
+});
+
+test("abort, error, pending input and existing continuation never start another autonomous request", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		await approveMode(picker);
+		for (const changes of [{ outcome: "aborted" }, { outcome: "error" }, { continue: true }, { context: { ...settleEvent().context, pendingMessages: [{}] } }]) {
+			assert.equal(await settle(picker, { ...settleEvent(), ...changes }), undefined);
+		}
+		picker.ctx.signal = AbortSignal.abort();
+		assert.equal(await settle(picker), undefined);
+		assert.equal(picker.emitted.some(({ channel }) => channel === "subagents:rpc:v1:request"), false);
+	} finally { await picker.dispose(); }
+});
+
+test("asynchronous native reads cannot revive revoked, replaced, expired, aborted or input-owned sessions", async () => {
+	for (const change of ["off", "replacement", "switch", "session-id", "expiry", "abort", "pending"] as const) {
+		const picker = await loadPicker("tui");
+		try {
+			const approved = await approveMode(picker);
+			const controller = new AbortController();
+			picker.ctx.signal = controller.signal;
+			let heldRequest: any;
+			picker.api.events.on("subagents:rpc:v1:request", (raw) => {
+				const request = raw as any;
+				if (request.method === "ping") nativeReply(picker, request, nativePing());
+				else heldRequest = request;
+			});
+			const pending = settle(picker);
+			await waitForComponent(() => heldRequest);
+			if (change === "off") await picker.commands.get("autonomous").handler("off", picker.ctx);
+			if (change === "replacement") await approveMode(picker);
+			if (change === "switch") picker.lifecycleHandlers.get("session_before_switch")?.({}, picker.ctx);
+			if (change === "session-id") picker.ctx.sessionManager.getSessionId = () => "other-session";
+			if (change === "expiry") approved.details.approval.expiresAt = "2000-01-01T00:00:00Z";
+			if (change === "abort") controller.abort();
+			if (change === "pending") picker.ctx.hasPendingMessages = () => true;
+			nativeReply(picker, heldRequest, { fleet: { version: 1, entries: [], totalActive: 0, omitted: 0 } });
+			assert.equal(await pending, undefined, change);
+			assert.equal(picker.notices.some((notice) => notice.includes("AUTONOMOUS BLOCKER")), false, change);
+		} finally { await picker.dispose(); }
+	}
+});
+
+test("invalid native contracts revoke automation as a blocker, never as task completion", async () => {
+	for (const fault of ["version", "correlation", "failure", "capability", "session", "fleet", "overflow"] as const) {
+		const picker = await loadPicker("tui");
+		try {
+			await approveMode(picker);
+			picker.api.events.on("subagents:rpc:v1:request", (raw) => {
+				const request = raw as any;
+				if (fault === "version" || fault === "correlation" || fault === "failure") {
+					picker.api.events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+						version: fault === "version" ? 2 : 1, requestId: fault === "correlation" ? "wrong" : request.requestId,
+						method: request.method, success: fault !== "failure", data: nativePing(),
+					});
+				} else if (request.method === "ping") {
+					const data = nativePing();
+					if (fault === "capability") data.capabilities.fleetStatus.version = 2;
+					if (fault === "session") data.session.sessionId = "wrong";
+					nativeReply(picker, request, data);
+				} else nativeReply(picker, request, { fleet: { version: 1, entries: [], totalActive: fault === "fleet" ? -1 : 0, omitted: 1 } });
+			});
+			const result = await settle(picker);
+			assert.equal(result.continue, undefined, fault);
+			assert.match(result.entries[0].content, /Compatibility blocker/);
+			assert.equal(result.entries[0].details.isTaskComplete, false);
+			assert.equal((await modeStatus(picker)).details.isActive, false);
+			assert.equal(await settle(picker), undefined);
+		} finally { await picker.dispose(); }
+	}
+});
+
+test("a host without native tools needs no dependency, but missing advertised RPC is a bounded blocker", async () => {
+	for (const presence of ["absent", "tool", "ready", "notice", "status-timeout"] as const) {
+		const picker = await loadPicker("tui");
+		try {
+			await approveMode(picker);
+			if (presence === "tool") picker.tools.set("subagent", { name: "subagent" });
+			if (presence === "ready") picker.api.events.emit("subagents:rpc:v1:ready", nativePing());
+			if (presence === "status-timeout") picker.api.events.on("subagents:rpc:v1:request", (raw) => {
+				const request = raw as any;
+				if (request.method === "ping") nativeReply(picker, request, nativePing());
+			});
+			const event = settleEvent();
+			if (presence === "notice") event.context.contextMessages.push({ role: "custom", customType: "subagent-notify", content: "" });
+			const result = await settle(picker, event);
+			assert.equal(result.continue === true, presence === "absent");
+			assert.equal((await modeStatus(picker)).details.isActive, presence === "absent");
+			assert.equal(picker.emitted.filter(({ channel }) => channel === "subagents:rpc:v1:request").length, presence === "status-timeout" ? 2 : 1);
+		} finally { await picker.dispose(); }
+	}
+});
+
+test("native reminder ownership and later-hook exhaustion cannot be restarted by autonomous mode", async () => {
+	for (const customType of ["subagent-supervisor-blocked", "subagent-completion-unhandled"]) {
+		const picker = await loadPicker("tui");
+		try {
+			configureNative(picker);
+			await approveMode(picker);
+			const event = settleEvent();
+			event.context.contextMessages.push({ role: "custom", customType: customType === "subagent-supervisor-blocked" ? "subagent_supervisor_request" : "subagent-notify", content: "" });
+			assert.equal(await settle(picker, event), undefined);
+			assert.equal(picker.emitted.some(({ channel }) => /complete|wake|bg_wait/.test(channel)), false);
+			const nativeEntry = { type: "custom_message", customType, timestamp: new Date().toISOString(), content: "", details: { blocked: true } };
+			picker.branch.push(nativeEntry);
+			picker.lifecycleHandlers.get("agent_settled")?.({}, picker.ctx);
+			assert.equal((await modeStatus(picker)).details.isActive, false);
+			assert.match(picker.notices.at(-1)!, /Native reminder budget exhausted/);
+			assert.equal(picker.branch.at(-1).data.isTaskComplete, false);
+			assert.equal(await settle(picker), undefined);
+			await approveMode(picker);
+			const composed = await settle(picker, { ...settleEvent(), entries: [nativeEntry] });
+			assert.equal(composed.continue, undefined);
+			assert.equal(composed.entries.at(-1).details.isTaskComplete, false);
+			assert.equal((await modeStatus(picker)).details.isActive, false);
+		} finally { await picker.dispose(); }
 	}
 });
