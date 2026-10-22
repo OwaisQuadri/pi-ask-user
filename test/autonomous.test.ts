@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { guidanceForQuestion, isAutonomousScope, type AutonomousApproval } from "../src/autonomous.ts";
+import { guidanceForContinuation, guidanceForQuestion, isAutonomousScope, type AutonomousApproval } from "../src/autonomous.ts";
 
 const approval: AutonomousApproval = {
 	approvalId: "approval-1", sessionId: "owner", approvedAt: "2026-01-01T00:00:00Z",
@@ -11,13 +11,24 @@ const approval: AutonomousApproval = {
 const policy = { taskId: approval.taskId, scope: approval.scope, kind: "routine", isReversible: true };
 const now = Date.parse("2026-01-01T01:00:00Z");
 
-test("guidance never impersonates an answer or grants execution authority", () => {
-	const result = guidanceForQuestion(approval, "owner", policy, false, now)!;
-	assert.match(result, /AUTOMATIC POLICY GUIDANCE/);
-	assert.match(result, /not a human answer, selected option, or new approval/);
-	assert.match(result, /Approval ID: approval-1/);
-	assert.match(result, /docs\/principles.md/);
-	assert.match(result, /not execution authorization or a sandbox/);
+test("question and continuation guidance retain provenance and boundaries without copying decision policy", () => {
+	for (const result of [guidanceForQuestion(approval, "owner", policy, false, now)!, guidanceForContinuation(approval)]) {
+		assert.match(result, /AUTOMATIC POLICY GUIDANCE/);
+		assert.match(result, /not a human answer, selected option, or new approval/);
+		assert.match(result, /Approval ID: approval-1/);
+		assert.match(result, /interactive user in this session only/);
+		assert.match(result, /Owning session: owner\. Approval provenance: interactive-user/);
+		assert.match(result, /Task: task-1\. Scope: Update the picker/);
+		assert.ok(result.includes(approval.expiresAt));
+		assert.match(result, /docs\/principles.md/);
+		assert.match(result, /personal precedence as defined by those owners/);
+		assert.ok(result.includes(JSON.stringify(approval.protectedActions)));
+		assert.match(result, /not execution authorization or a sandbox/);
+		assert.match(result, /Credential controls, native permission prompts, command guards, and human-only merges/);
+		assert.match(result, /task_complete and taskId "task-1"/);
+		assert.match(result, /Revocation is not task completion/);
+		assert.doesNotMatch(result, /Resolve routine reversible decisions|fresh-context|heartbeat|night-time/);
+	}
 });
 
 test("secure, ambiguous, expanded, expired and child questions never receive automatic guidance", () => {

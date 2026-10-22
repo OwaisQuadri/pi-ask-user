@@ -1,8 +1,8 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
 import { randomBytes, randomUUID } from "node:crypto";
 import { access, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
-import { guidanceForQuestion, isAutonomousScope, isQuestionPolicy, type AutonomousApproval, type AutonomousScope } from "./autonomous.ts";
+import { guidanceForContinuation, guidanceForQuestion, nativeActiveWork, isAutonomousScope, isQuestionPolicy, type AutonomousApproval, type AutonomousScope } from "./autonomous.ts";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -983,6 +983,8 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	let owningSessionId: string | undefined;
 	let approval: AutonomousApproval | undefined;
 	let approvalRevision = 0;
+	let isNativeAdvertised = false;
+	pi.events.on("subagents:rpc:v1:ready", () => { isNativeAdvertised = true; });
 	const expireApproval = () => {
 		approval = undefined;
 		approvalRevision++;
@@ -1005,6 +1007,68 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		expireApproval();
 		activeContext = undefined;
+	});
+
+	function revokeForBlocker(ctx: ExtensionContext, current: AutonomousApproval, reason: string): CustomMessageEntryDraft {
+		expireApproval();
+		const content = `AUTONOMOUS BLOCKER: ${reason} Automation revoked; task ${current.taskId} is not marked complete.`;
+		ctx.ui.notify(content, "error");
+		return {
+			type: "custom_message", customType: "autonomous-blocked", display: true, content,
+			details: { provenance: "automatic-policy-guidance", approvalId: current.approvalId, taskId: current.taskId, isActive: false, isTaskComplete: false, reason },
+		};
+	}
+	const isNativeBlocker = (customType: string) => customType === "subagent-supervisor-blocked"
+		|| customType === "subagent-completion-unhandled";
+	const isNativeExhausted = (ctx: ExtensionContext, current: AutonomousApproval) => ctx.sessionManager.getBranch()
+		.some((entry) => entry.type === "custom_message" && isNativeBlocker(entry.customType)
+			&& Date.parse(entry.timestamp) >= Date.parse(current.approvedAt));
+
+	pi.on("agent_before_settle", async (event, ctx) => {
+		const current = currentApproval(ctx);
+		if (!current || event.outcome !== "completed") return;
+		const signal = ctx.signal;
+		const revision = approvalRevision;
+		const isCurrent = () => !signal?.aborted && !ctx.signal?.aborted && currentApproval(ctx) === current
+			&& approvalRevision === revision && ctx.sessionManager.getSessionId() === current.sessionId;
+		if (!isCurrent()) return;
+		if (isNativeExhausted(ctx, current)
+			|| event.entries.some((entry) => entry.type === "custom_message" && isNativeBlocker(entry.customType))) {
+			return { entries: [...event.entries, revokeForBlocker(ctx, current, "Native reminder budget exhausted.")] };
+		}
+		if (event.continue || event.context.pendingMessages.length || ctx.hasPendingMessages()) return;
+		const messages = event.context.contextMessages;
+		const nativeNoticeIndex = messages.findLastIndex((message) => message.role === "custom"
+			&& ["subagent-notify", "subagent_supervisor_request", "subagent-completion-unanswered", "subagent-supervisor-unanswered"].includes(message.customType));
+		const isNativeReminderPending = nativeNoticeIndex !== -1 && !messages.slice(nativeNoticeIndex + 1).some((message) => message.role === "assistant"
+			&& message.content.some((part) => part.type === "toolCall" || (part.type === "text" && part.text.trim())));
+		let totalActive: number;
+		try {
+			totalActive = await nativeActiveWork(pi, current.sessionId, () => isNativeAdvertised || isNativeReminderPending,
+				() => isCurrent() && !ctx.hasPendingMessages() && !event.context.pendingMessages.length && !event.continue, signal);
+		} catch (error) {
+			if (!isCurrent() || ctx.hasPendingMessages() || event.context.pendingMessages.length) return;
+			const reason = `Compatibility blocker: ${error instanceof Error ? error.message : "Native status unavailable."}`;
+			return { entries: [...event.entries, revokeForBlocker(ctx, current, reason)] };
+		}
+		if (!isCurrent() || ctx.hasPendingMessages() || event.context.pendingMessages.length || event.continue
+			|| totalActive > 0 || isNativeReminderPending) return;
+		return {
+			entries: [...event.entries, {
+				type: "custom_message" as const, customType: "autonomous-continuation", display: true,
+				content: guidanceForContinuation(current),
+				details: { provenance: "automatic-policy-guidance", approvalId: current.approvalId, taskId: current.taskId },
+			}],
+			continue: true,
+		};
+	});
+	pi.on("agent_settled", (_event, ctx) => {
+		const current = currentApproval(ctx);
+		if (!current) return;
+		if (isNativeExhausted(ctx, current)) {
+			const entry = revokeForBlocker(ctx, current, "Native reminder budget exhausted.");
+			pi.appendEntry(entry.customType, entry.details);
+		}
 	});
 
 	function modeResult(ctx: ExtensionContext, message?: string) {
@@ -1094,7 +1158,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "autonomous_mode",
 		label: "Autonomous mode",
-		description: "Request human-reviewed enablement or widening in the owning interactive session. Never approves itself. Disable or report status locally. Close the task explicitly with task_complete; approval is not execution authorization.",
+		description: "Request human-reviewed enablement or widening in the owning interactive session. Never approves itself. Report status locally. Use off and report a real blocker without declaring completion. Close a completed task explicitly with matching task_complete; approval is not execution authorization.",
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("on"), Type.Literal("off"), Type.Literal("status"), Type.Literal("task_complete")]),
 			scope: Type.Optional(AutonomousScopeSchema),
