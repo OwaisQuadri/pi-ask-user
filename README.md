@@ -127,7 +127,7 @@ Human answers use `provenance: "interactive-user"`.
 
 During active autonomy, missing or mismatched metadata returns an **AI ROUTING ERROR** tool error without opening a user dialog. The agent must resolve routine work or retry with the exact task metadata and an appropriate human-input kind. A routing error never grants authority.
 Secure fields, matching approval and essential-information questions, and unmatched protected actions remain interactive. Without active approval, ordinary question behavior is unchanged.
-Nonsecure child RPC questions during active autonomy receive an AI routing error that directs them to their supervisor. No approval record is sent to the child. Outside active autonomy, child questions keep their existing interactive route.
+Routine child RPC questions during active autonomy receive an AI routing error that directs them to their supervisor. Approval, essential-information, and secure child questions remain interactive. No approval record is sent to the child. Outside active autonomy, child questions keep their existing interactive route.
 RPC and child instances cannot enable the mode or receive the owning session's approval.
 Use the owning terminal session explicitly for approval; this extension does not infer ownership from `hasUI` alone.
 
