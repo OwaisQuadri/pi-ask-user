@@ -7,6 +7,7 @@ const approval: AutonomousApproval = {
 	provenance: "interactive-user", expiresOn: "task_complete", expiresAt: "2026-01-02T00:00:00Z",
 	taskId: "task-1", scope: "Update the picker", principleSources: ["docs/principles.md"],
 	protectedActions: [{ action: "publish", target: "draft-pr", bounds: "draft only" }],
+	preparation: { decisions: ["Update the picker only"], credentials: [], accessChecks: ["No credentials required"] },
 };
 const policy = { taskId: approval.taskId, scope: approval.scope, kind: "routine", isReversible: true };
 const now = Date.parse("2026-01-01T01:00:00Z");
@@ -31,16 +32,23 @@ test("question and continuation guidance retain provenance and boundaries withou
 	}
 });
 
-test("secure, ambiguous, expanded, expired and child questions never receive automatic guidance", () => {
+test("secure, approval, information, expired and child questions never receive automatic guidance", () => {
 	for (const [sessionId, metadata, isSecure, time] of [
 		["owner", policy, true, now], ["child", policy, false, now],
-		["owner", undefined, false, now], ["owner", { ...policy, kind: "approval" }, false, now],
-		["owner", { ...policy, scope: "Another task" }, false, now],
-		["owner", { ...policy, taskId: "another" }, false, now],
-		["owner", { ...policy, isReversible: false }, false, now],
+		["owner", { ...policy, kind: "approval" }, false, now],
+		["owner", { ...policy, kind: "information" }, false, now],
 		["owner", policy, false, Date.parse(approval.expiresAt)],
 	] as const) assert.equal(guidanceForQuestion(approval, sessionId, metadata, isSecure, time), undefined);
 	assert.equal(guidanceForQuestion(undefined, "owner", policy, false, now), undefined);
+});
+
+test("missing or mismatched task metadata returns AI routing errors rather than asking the human", () => {
+	for (const metadata of [undefined, { ...policy, scope: "Another task" }, { ...policy, taskId: "another" }, { ...policy, isReversible: false }]) {
+		const result = guidanceForQuestion(approval, "owner", metadata, false, now)!;
+		assert.match(result, /AI AUTO-REPLY/);
+		assert.match(result, /AI ROUTING ERROR: No human was asked/);
+		assert.match(result, /Never guess consent/);
+	}
 });
 
 test("protected guidance requires exact action, target and bounds from the approved record", () => {

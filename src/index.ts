@@ -1,9 +1,10 @@
-import type { ExtensionAPI, ExtensionContext, CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
 import { randomBytes, randomUUID } from "node:crypto";
 import { access, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { guidanceForContinuation, guidanceForQuestion, nativeActiveWork, isAutonomousScope, isQuestionPolicy, type AutonomousApproval, type AutonomousScope } from "./autonomous.ts";
 import { tmpdir } from "node:os";
+import { showApproval } from "./approval.ts";
 import { join, resolve } from "node:path";
 import {
 	Editor,
@@ -101,12 +102,17 @@ const AutonomousScopeSchema = Type.Object({
 	protectedActions: Type.Array(ProtectedActionSchema),
 	principleSources: Type.Array(Type.String({ description: "Existing readable owner file path. No secrets or policy copies." })),
 	expiresAt: Type.String({ description: "Finite ISO date-time. Approval also expires at task completion." }),
+	preparation: Type.Object({
+		decisions: Type.Array(Type.String(), { description: "Scope decisions settled with the user during the grill session." }),
+		credentials: Type.Array(Type.String(), { description: "Required registered credential names. Empty when none are needed. Never values." }),
+		accessChecks: Type.Array(Type.String(), { description: "Completed access and permission checks, including grant results. State explicitly when none are required." }),
+	}, { additionalProperties: false }),
 }, { additionalProperties: false });
 
 const QuestionPolicySchema = Type.Object({
 	taskId: Type.String(),
 	scope: Type.String({ description: "Exact approved task scope. Metadata never grants authority." }),
-	kind: Type.Union([Type.Literal("routine"), Type.Literal("protected"), Type.Literal("approval")]),
+	kind: Type.Union([Type.Literal("routine"), Type.Literal("protected"), Type.Literal("approval"), Type.Literal("information")]),
 	isReversible: Type.Optional(Type.Boolean()),
 	protectedAction: Type.Optional(ProtectedActionSchema),
 }, { additionalProperties: false });
@@ -896,7 +902,7 @@ async function executeQuestion(
 	signal: AbortSignal | undefined,
 	ctx: ExtensionContext,
 	isContextActive?: () => boolean,
-	getGuidance?: () => { text: string; approvalId: string } | undefined,
+	getGuidance?: () => { text: string; approvalId?: string; isError?: boolean } | undefined,
 ) {
 	const options = normalizeOptions(params.options);
 	const context = params.details?.trim() || undefined;
@@ -933,6 +939,7 @@ async function executeQuestion(
 		if (guidance) {
 			return {
 				content: [{ type: "text" as const, text: guidance.text }],
+				isError: guidance.isError === true,
 				details: {
 					...buildStructuredResult("policy-guidance", params.question, mode, [], context, guidance.text),
 					provenance: "automatic-policy-guidance" as const,
@@ -983,17 +990,34 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	let owningSessionId: string | undefined;
 	let approval: AutonomousApproval | undefined;
 	let approvalRevision = 0;
+	let isPreparing = false;
+	let preparationAnswers = 0;
+	let expiryTimer: ReturnType<typeof setTimeout> | undefined;
 	let isNativeAdvertised = false;
+	let connectionError: string | undefined;
+	let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+	let recoveryAttempts = 0;
+	const cancelRecovery = () => {
+		clearTimeout(recoveryTimer);
+		recoveryTimer = undefined;
+		connectionError = undefined;
+	};
 	pi.events.on("subagents:rpc:v1:ready", () => { isNativeAdvertised = true; });
 	const expireApproval = () => {
+		cancelRecovery();
+		recoveryAttempts = 0;
+		clearTimeout(expiryTimer);
 		approval = undefined;
+		isPreparing = false;
+		preparationAnswers = 0;
 		approvalRevision++;
+		activeContext?.ui.setStatus("autonomous", undefined);
 	};
 	const isOwningSession = (ctx: ExtensionContext) => ctx.mode === "tui" && ctx.hasUI
 		&& activeContext !== undefined && owningSessionId === ctx.sessionManager.getSessionId();
 	function currentApproval(ctx: ExtensionContext): AutonomousApproval | undefined {
 		if (approval && Date.parse(approval.expiresAt) <= Date.now()) expireApproval();
-		return isOwningSession(ctx) ? approval : undefined;
+		return isOwningSession(ctx) && !isPreparing ? approval : undefined;
 	}
 	pi.on("session_start", (_event, ctx) => {
 		expireApproval();
@@ -1012,6 +1036,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	function revokeForBlocker(ctx: ExtensionContext, current: AutonomousApproval, reason: string): CustomMessageEntryDraft {
 		expireApproval();
 		const content = `AUTONOMOUS BLOCKER: ${reason} Automation revoked; task ${current.taskId} is not marked complete.`;
+		refreshStatus(ctx, "Autonomous · Blocked");
 		ctx.ui.notify(content, "error");
 		return {
 			type: "custom_message", customType: "autonomous-blocked", display: true, content,
@@ -1062,26 +1087,76 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			continue: true,
 		};
 	});
-	pi.on("agent_settled", (_event, ctx) => {
+	pi.on("message_end", (event, ctx) => {
+		if (!currentApproval(ctx) || event.message.role !== "assistant") return;
+		connectionError = event.message.stopReason === "error" && /connection error/i.test(event.message.errorMessage ?? "")
+			? event.message.errorMessage : undefined;
+		if (event.message.stopReason !== "error") recoveryAttempts = 0;
+	});
+	pi.on("input", () => {
+		cancelRecovery();
+		if (activeContext) refreshStatus(activeContext);
+	});
+	pi.on("agent_start", cancelRecovery);
+	pi.on("agent_settled", (event, ctx) => {
 		const current = currentApproval(ctx);
 		if (!current) return;
 		if (isNativeExhausted(ctx, current)) {
 			const entry = revokeForBlocker(ctx, current, "Native reminder budget exhausted.");
 			pi.appendEntry(entry.customType, entry.details);
+			return;
 		}
+		if (event.aborted || !connectionError || recoveryTimer || ctx.hasPendingMessages()) return;
+		const revision = approvalRevision;
+		const delay = Math.min(30_000 * 2 ** Math.min(recoveryAttempts++, 4), 300_000);
+		const retryAt = Date.now() + delay;
+		if (retryAt >= Date.parse(current.expiresAt)) return;
+		refreshStatus(ctx, `Autonomous · Connection retry ${new Date(retryAt).toLocaleTimeString()} · /autonomous off`);
+		recoveryTimer = setTimeout(() => {
+			cancelRecovery();
+			if (currentApproval(ctx) !== current || approvalRevision !== revision || ctx.hasPendingMessages() || !ctx.isIdle()) return;
+			refreshStatus(ctx);
+			pi.sendMessage({
+				customType: "autonomous-connection-retry", display: true,
+				content: "AI AUTO-REPLY (artificial intelligence). The connection failed after the host retries ended. Continue the approved task from its recorded state. Check tool results before repeating any operation. This is not a human answer or new execution authority.",
+				details: { provenance: "automatic-policy-guidance", approvalId: current.approvalId, taskId: current.taskId },
+			}, { triggerTurn: true });
+		}, delay);
+		recoveryTimer.unref();
 	});
+
+	function refreshStatus(ctx: ExtensionContext, state?: string) {
+		if (!isOwningSession(ctx)) return;
+		const current = currentApproval(ctx);
+		ctx.ui.setStatus("autonomous", state || (isPreparing ? "Autonomous · Preparing scope and access"
+			: current ? `Autonomous · Running · /autonomous off · ${current.scope.replace(/\s+/g, " ")}` : undefined));
+	}
+
+	function beginPreparation(ctx: ExtensionContext) {
+		if (!isOwningSession(ctx)) return modeResult(ctx, "Prepare autonomy in the owning interactive session.");
+		expireApproval();
+		isPreparing = true;
+		refreshStatus(ctx);
+		return modeResult(ctx, [
+			"Autonomous preparation only. No autonomous approval is active.",
+			"Start a grill session with the user. Ask one question at a time with ask_user_question. Settle the outcome, acceptance checks, exclusions, limits, and completion condition. Investigate available facts yourself.",
+			"Identify required credentials and permissions. Use cred_list to check metadata, never secret values. Resolve missing credentials through cred_ask and grants through the existing credential controls, including owner Touch ID. Put any /cred grant command in normal chat, not in a question dialog. Do not perform a side-effectful operation merely to trigger a grant.",
+			"Complete safe access checks and record remaining per-use approvals honestly. Never mark an ungranted credential or denied permission ready. If no access is required, record that explicitly.",
+			"When the interview and access preparation are complete, call autonomous_mode on with the settled scope and preparation summary. The user must choose Approve and start. Do not change dreaming.",
+		].join("\n"));
+	}
 
 	function modeResult(ctx: ExtensionContext, message?: string) {
 		const current = currentApproval(ctx);
 		return {
 			content: [{ type: "text" as const, text: message || (current
-				? `Autonomous policy guidance is on.\n${JSON.stringify(current, null, 2)}`
-				: "Autonomous policy guidance is off.") }],
-			details: { isActive: !!current, approval: current, message },
+				? `Autonomous policy guidance is on.\nTask: ${current.scope}\nEnds at task completion or ${new Date(current.expiresAt).toLocaleString()}.\nStop: /autonomous off`
+				: isPreparing ? "Preparing autonomous scope and access. Approval is not yet active." : "Autonomous policy guidance is off.") }],
+			details: { isActive: !!current, isPreparing, approval: current, message },
 		};
 	}
 
-	async function enableMode(ctx: ExtensionContext, proposed: AutonomousScope | undefined, signal?: AbortSignal) {
+	async function enableMode(ctx: ExtensionToolContext, proposed: AutonomousScope | undefined, signal?: AbortSignal) {
 		if (!isOwningSession(ctx)) return modeResult(ctx, "Enable autonomous mode in the owning interactive TUI session. Child and RPC sessions cannot inherit approval.");
 		const revision = approvalRevision;
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -1091,22 +1166,26 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			if (!isCurrent()) return modeResult(ctx, "Autonomous approval request expired or was cancelled.");
 			pi.events.emit("herdr:blocked", { active: true, label: "Review autonomous scope" });
 			try {
-				const template = proposed || {
-					taskId: "", scope: "", protectedActions: [], principleSources: [],
-					expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-				};
-				const edited = await ctx.ui.editor("Review autonomous scope (nonsecret JSON)", JSON.stringify(template, null, 2));
-				if (edited === undefined || !isCurrent()) return modeResult(ctx, "Autonomous approval cancelled.");
-				let value: unknown;
-				try { value = JSON.parse(edited); } catch { return modeResult(ctx, "Invalid scope JSON. Autonomous approval unchanged."); }
-				if (!isAutonomousScope(value) || Date.parse(value.expiresAt) <= Date.now()) {
-					return modeResult(ctx, "Scope requires taskId, scope, exact protectedActions, existing principleSources, and a future expiresAt.");
+				if (!isPreparing || preparationAnswers === 0) return beginPreparation(ctx);
+				if (!isAutonomousScope(proposed) || Date.parse(proposed.expiresAt) <= Date.now()) {
+					return modeResult(ctx, "Complete the scope interview and access preparation. Supply a settled scope, preparation summary, readable principle sources, and a future expiry.");
 				}
 				const reviewed: AutonomousScope = {
-					taskId: value.taskId, scope: value.scope, expiresAt: value.expiresAt,
-					protectedActions: value.protectedActions.map(({ action, target, bounds }) => ({ action, target, bounds })),
-					principleSources: value.principleSources.map((source) => resolve(ctx.cwd, source)),
+					taskId: proposed.taskId, scope: proposed.scope, expiresAt: proposed.expiresAt,
+					protectedActions: proposed.protectedActions.map(({ action, target, bounds }) => ({ action, target, bounds })),
+					principleSources: proposed.principleSources.map((source) => resolve(ctx.cwd, source)),
+					preparation: {
+						decisions: [...proposed.preparation.decisions], credentials: [...proposed.preparation.credentials],
+						accessChecks: [...proposed.preparation.accessChecks],
+					},
 				};
+				if (reviewed.preparation.credentials.length) {
+					if (!ctx.tools.some(({ name }) => name === "cred_list")) return modeResult(ctx, "Credential checks unavailable. Complete access preparation before starting.");
+					const listing = await ctx.executeTool("cred_list", {}, { signal });
+					const catalog = listing.result.details as { credentials?: Array<{ name: string; isGranted: boolean }> } | undefined;
+					const missing = reviewed.preparation.credentials.filter((name) => !catalog?.credentials?.some((item) => item.name === name && item.isGranted === true));
+					if (listing.isError || missing.length) return modeResult(ctx, `Access preparation blocked. Required credentials are not verified as granted: ${missing.join(", ") || "credential listing failed"}. Use the existing credential grant flow with owner authentication, then retry.`);
+				}
 				try {
 					for (const source of reviewed.principleSources) {
 						await access(source, constants.R_OK);
@@ -1116,21 +1195,40 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 					return modeResult(ctx, "Each principle source must be an existing readable owner file. Autonomous approval unchanged.");
 				}
 				if (!isCurrent()) return modeResult(ctx, "Autonomous approval request expired.");
-				const isApproved = await ctx.ui.confirm("Approve autonomous policy guidance?", [
-					JSON.stringify(reviewed, null, 2),
-					"This replaces any earlier approval in this session. It expires at task completion or expiresAt, whichever comes first.",
-					"Only approve nonsecret references and exact targets and bounds. No wildcard matching applies.",
-					"This is not execution authorization or a sandbox. Credential controls, native prompts, command guards and human-only merges remain authoritative.",
-					"Secure fields, new authority and expanded scope still require interaction. Children receive no approval.",
-				].join("\n\n"));
-				if (!isApproved || !isCurrent() || Date.parse(reviewed.expiresAt) <= Date.now()) return modeResult(ctx, "Autonomous approval not granted.");
+				refreshStatus(ctx, "Autonomous · Needs approval");
+				const choice = await showApproval(ctx, [
+					`Task: ${reviewed.scope}`,
+					`Scope decisions:\n${reviewed.preparation.decisions.map((item) => `  • ${item}`).join("\n")}`,
+					`Access:\n${reviewed.preparation.accessChecks.map((item) => `  • ${item}`).join("\n")}`,
+					`Credentials: ${reviewed.preparation.credentials.join(", ") || "None required"}`,
+					`Limits: ${reviewed.protectedActions.length ? reviewed.protectedActions.map((item) => `${item.action} · ${item.target} · ${item.bounds}`).join("; ") : "No additional protected actions"}`,
+					`Ends: task completion or ${new Date(reviewed.expiresAt).toLocaleString()}`,
+					`Principle sources: ${reviewed.principleSources.join(", ")}`,
+					"Approval is not execution authorization. Credentials, native permissions, and human-only merges keep their own controls.",
+				].join("\n\n"), signal);
+				if (!isCurrent() || Date.parse(reviewed.expiresAt) <= Date.now()) return modeResult(ctx, "Autonomous approval expired or was cancelled.");
+				if (choice === "Edit scope") return modeResult(ctx, "Return to the grill session. Ask which scope or access detail to change, then present the revised approval sheet.");
+				if (choice !== "Approve and start") {
+					expireApproval();
+					return modeResult(ctx, "Autonomous approval not granted.");
+				}
 				approval = {
 					...reviewed, sessionId, approvalId: randomUUID(), approvedAt: new Date().toISOString(),
 					provenance: "interactive-user", expiresOn: "task_complete",
 				};
 				approvalRevision++;
+				isPreparing = false;
+				const scheduleExpiry = () => {
+					if (!approval) return;
+					const remaining = Date.parse(approval.expiresAt) - Date.now();
+					if (remaining <= 0) { expireApproval(); return; }
+					expiryTimer = setTimeout(scheduleExpiry, Math.min(remaining, 2_147_483_647));
+					expiryTimer.unref();
+				};
+				scheduleExpiry();
 				return modeResult(ctx);
 			} finally {
+				refreshStatus(ctx);
 				pi.events.emit("herdr:blocked", { active: false });
 			}
 		});
@@ -1140,7 +1238,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		description: "Manage session-owned autonomous policy guidance",
 		getArgumentCompletions(argumentText) {
 			return [
-				{ value: "on", label: "on", description: "Review task scope and request human approval" },
+				{ value: "on", label: "on", description: "Grill scope, prepare access, then approve and start" },
 				{ value: "off", label: "off", description: "Revoke approval, including at task completion" },
 				{ value: "status", label: "status", description: "Show this session's approval and expiry" },
 			].filter((item) => item.value.startsWith(argumentText));
@@ -1148,7 +1246,12 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		async handler(args, ctx) {
 			const action = args.trim();
 			if (action === "off" && isOwningSession(ctx)) expireApproval();
-			const result = action === "on" ? await enableMode(ctx, undefined)
+			if (action === "on" && isOwningSession(ctx)) {
+				const preparation = beginPreparation(ctx);
+				pi.sendMessage({ customType: "autonomous-preparation", content: preparation.content[0].text, display: true }, { triggerTurn: true });
+				return;
+			}
+			const result = action === "on" ? modeResult(ctx, "Prepare autonomy in the owning interactive session.")
 				: action === "off" || action === "status" ? modeResult(ctx)
 				: modeResult(ctx, "Usage: /autonomous on|off|status");
 			ctx.ui.notify(result.content[0].text, "info");
@@ -1158,18 +1261,25 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "autonomous_mode",
 		label: "Autonomous mode",
-		description: "Request human-reviewed enablement or widening in the owning interactive session. Never approves itself. Report status locally. Use off and report a real blocker without declaring completion. Close a completed task explicitly with matching task_complete; approval is not execution authorization.",
+		description: "Prepare autonomous work with a human grill session and credential/permission checks first (action prepare). Ask one scope question at a time. Complete needed grants with the existing credential controls and Touch ID. Then request human approval with action on and a settled scope/preparation summary. Never approves itself. Use off for blockers and matching task_complete for completion. Do not change dreaming.",
 		parameters: Type.Object({
-			action: Type.Union([Type.Literal("on"), Type.Literal("off"), Type.Literal("status"), Type.Literal("task_complete")]),
+			action: Type.Union([Type.Literal("prepare"), Type.Literal("on"), Type.Literal("off"), Type.Literal("status"), Type.Literal("task_complete")]),
 			scope: Type.Optional(AutonomousScopeSchema),
 			taskId: Type.Optional(Type.String({ description: "Required for task_complete; must match the active task." })),
 		}, { additionalProperties: false }),
 		async execute(_id, params, signal, _update, ctx) {
+			if (params.action === "prepare") return beginPreparation(ctx);
 			if (params.action === "on") return enableMode(ctx, params.scope, signal);
-			if (params.action === "task_complete" && params.taskId !== currentApproval(ctx)?.taskId) {
+			if (params.action === "task_complete" && (!currentApproval(ctx) || params.taskId !== currentApproval(ctx)?.taskId)) {
 				return modeResult(ctx, "task_complete requires the active taskId.");
 			}
-			if ((params.action === "off" || params.action === "task_complete") && isOwningSession(ctx)) expireApproval();
+			if ((params.action === "off" || params.action === "task_complete") && isOwningSession(ctx)) {
+				expireApproval();
+				if (params.action === "task_complete") {
+					refreshStatus(ctx, "Autonomous · Complete");
+					return modeResult(ctx, "Autonomous task complete.");
+				}
+			}
 			return modeResult(ctx);
 		},
 	});
@@ -1214,7 +1324,13 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			if (!isAskUserQuestionInput(request.params)) throw new Error("Invalid ask_user_question parameters");
 			if (request.signal !== undefined && !isAbortSignal(request.signal)) throw new Error("Invalid ask_user_question abort signal");
 			const context = activeContext;
-			const data = await executeQuestion(pi, request.params, request.signal, context, () => activeContext === context);
+			const data = await executeQuestion(pi, request.params, request.signal, context, () => activeContext === context, () => {
+				if (!currentApproval(context) || request.params.secure) return undefined;
+				return {
+					text: "AI AUTO-REPLY (artificial intelligence). AI ROUTING ERROR: No human was asked. Send this decision to your supervising agent through its existing supervisor channel. You receive no autonomous approval or execution authority. The supervisor must resolve routine work or request human approval for a new boundary.",
+					isError: true,
+				};
+			});
 			pi.events.emit(replyChannel, { success: true, data });
 		} catch (error) {
 			pi.events.emit(replyChannel, {
@@ -1233,7 +1349,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			"Use this tool to ask exactly one clarifying question, missing-requirement question, preference question, or decision question before continuing.",
 		promptGuidelines: [
 			"Ask exactly one question per tool call.",
-			"Supply policy metadata only for the exact approved task. Ambiguous questions remain interactive.",
+			"During autonomous preparation, grill the user one question at a time; these questions remain human. During active autonomy, routine decisions return AI guidance. Missing or mismatched metadata returns an AI routing error, not a human dialog. Use exact task metadata and kind information only for essential information the user alone holds.",
 			"Use kind approval for enablement, widening, or requests for new authority. Never classify these as routine.",
 			"Automatic POLICY GUIDANCE is not a human answer or execution permission. Follow its principle sources and authority limits.",
 			"If you need answers to multiple questions, make multiple separate ask_user_question tool calls instead of combining them into one prompt.",
@@ -1246,11 +1362,19 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		parameters: AskUserQuestionParams,
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			return executeQuestion(pi, params, signal, ctx, undefined, () => {
-				const current = currentApproval(ctx);
-				const text = guidanceForQuestion(current, ctx.sessionManager.getSessionId(), params.policy, params.secure === true);
-				return text && current ? { text, approvalId: current.approvalId } : undefined;
-			});
+			const revision = approvalRevision;
+			try {
+				const result = await executeQuestion(pi, params, signal, ctx, undefined, () => {
+					const current = currentApproval(ctx);
+					const text = guidanceForQuestion(current, ctx.sessionManager.getSessionId(), params.policy, params.secure === true);
+					if (text && current) return { text, approvalId: current.approvalId, isError: text.includes("AI ROUTING ERROR:") };
+					if (current) refreshStatus(ctx, "Autonomous · Needs human input");
+					return undefined;
+				});
+				if (isOwningSession(ctx) && isPreparing && revision === approvalRevision
+					&& result.details.status === "answered" && result.details.provenance === "interactive-user" && !params.secure) preparationAnswers++;
+				return result;
+			} finally { refreshStatus(ctx); }
 		},
 
 		renderCall(args, theme) {
@@ -1267,7 +1391,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			return new Text(text, 0, 0);
 		},
 
-		renderResult(result, _options, theme) {
+		renderResult(result, options, theme) {
 			const details = result.details as AskUserQuestionResultDetails | undefined;
 			if (!details) {
 				const first = result.content[0];
@@ -1275,7 +1399,11 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			}
 
 			if (details.status === "policy-guidance") {
-				return new Text(theme.fg("accent", details.message || "AUTOMATIC POLICY GUIDANCE"), 0, 0);
+				const first = result.content[0];
+				const text = options.expanded && first?.type === "text" ? first.text
+					: result.isError ? "AI auto-reply · Routing error. No human was asked. Repair the task metadata."
+					: "AI auto-reply · Apply the approved task guidance. No human answer or new approval.";
+				return new Text(theme.fg("warning", text), 0, 0);
 			}
 
 			if (details.status === "cancelled") {

@@ -8,12 +8,30 @@ import { test } from "node:test";
 const extensionPath = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 
 const tuiModule = `
-export const Key = { up: "UP", down: "DOWN", enter: "ENTER", space: "SPACE", backspace: "BACKSPACE", escape: "ESC", ctrl: (key) => "CTRL_" + key };
+export const Key = { up: "UP", down: "DOWN", enter: "ENTER", space: "SPACE", backspace: "BACKSPACE", escape: "ESC", pageUp: "PAGE_UP", pageDown: "PAGE_DOWN", ctrl: (key) => "CTRL_" + key };
 export const getNativeClipboard = () => globalThis.__askClipboard;
 export const matchesKey = (data, key) => data === key;
 export const truncateToWidth = (text) => text;
 export const wrapTextWithAnsi = (text) => [text];
-export class Text { constructor(text) { this.text = text; } }
+export class Text { constructor(text) { this.text = text; } render() { return this.text.split("\\n"); } invalidate() {} }
+export class ScrollView {
+	constructor(child) { this.child = child; this.scrollTop = 0; this.max = 0; }
+	render(width) { return this.child.render(width); }
+	updateLayout(total, height) { this.max = Math.max(0, total - height); this.scrollTop = Math.min(this.scrollTop, this.max); }
+	scrollBy(lines) { this.scrollTop = Math.max(0, Math.min(this.max, this.scrollTop + lines)); }
+	invalidate() {}
+}
+export class SelectList {
+	constructor(items) { this.items = items; this.index = 0; }
+	render() { return this.items.map((item, index) => (index === this.index ? "→ " : "  ") + item.label); }
+	handleInput(key) {
+		if (key === "DOWN") this.index = (this.index + 1) % this.items.length;
+		if (key === "UP") this.index = (this.index + this.items.length - 1) % this.items.length;
+		if (key === "ENTER") this.onSelect?.(this.items[this.index]);
+		if (key === "ESC") this.onCancel?.();
+	}
+	invalidate() {}
+}
 export class Editor {
 	constructor() { this.text = ""; this.onSubmit = undefined; }
 	setText(text) { this.text = text; }
@@ -52,6 +70,7 @@ async function loadPicker(mode = "rpc") {
 	const root = await mkdtemp(join(tmpdir(), "ask-user-question-"));
 	await writeFile(join(root, "ask-user-question.ts"), await readFile(extensionPath));
 	await writeFile(join(root, "autonomous.ts"), await readFile(new URL("../src/autonomous.ts", import.meta.url)));
+	await writeFile(join(root, "approval.ts"), await readFile(new URL("../src/approval.ts", import.meta.url)));
 	await writeModule(root, "@earendil-works/pi-tui", tuiModule);
 	await writeModule(root, "typebox", typeboxModule);
 	await writeModule(root, "@earendil-works/pi-coding-agent", "");
@@ -69,6 +88,11 @@ async function loadPicker(mode = "rpc") {
 	const confirmCalls: Array<{ title: string; message: string }> = [];
 	let resolveConfirm: ((isApproved: boolean) => void) | undefined;
 	const notices: string[] = [];
+	const statuses = new Map<string, string | undefined>();
+	const selections: Array<{ title: string; options: string[] }> = [];
+	let resolveSelection: ((choice: string | undefined) => void) | undefined;
+	const sentMessages: any[] = [];
+	const credentialCatalog = { credentials: [] as Array<{ name: string; isGranted: boolean }> };
 	const branch: any[] = [];
 	const theme = {
 		fg(_name: string, text: string) {
@@ -84,8 +108,16 @@ async function loadPicker(mode = "rpc") {
 		cwd: root,
 		signal: undefined as AbortSignal | undefined,
 		hasPendingMessages: () => false,
+		isIdle: () => true,
+		tools: [{ name: "cred_list" }],
+		executeTool: async () => ({ result: { details: credentialCatalog }, isError: false }),
 		sessionManager: { getSessionId: () => "session-1", getBranch: () => branch },
 		ui: {
+			setStatus(key: string, value: string | undefined) { statuses.set(key, value); },
+			select(title: string, options: string[]) {
+				selections.push({ title, options });
+				return new Promise<string | undefined>((resolve) => { resolveSelection = resolve; });
+			},
 			confirm(title: string, message: string) {
 				confirmCalls.push({ title, message });
 				return new Promise<boolean>((resolve) => { resolveConfirm = resolve; });
@@ -96,7 +128,24 @@ async function loadPicker(mode = "rpc") {
 			custom(factory: any) {
 				customCallCount++;
 				return new Promise((resolve) => {
-					component = factory({ requestRender() {} }, theme, {}, resolve);
+					component = factory({ requestRender() {}, terminal: { rows: 24 } }, theme, {}, resolve);
+					if (component.render(80)[0] === "Approve autonomous work") {
+						const pages: string[] = [];
+						for (let page = 0; page < 8; page++) {
+							const lines = component.render(80);
+							assert.ok(lines.length <= 17);
+							assert.match(lines.join("\n"), /Approve and start/);
+							pages.push(lines.join("\n"));
+							component.handleInput("PAGE_DOWN");
+						}
+						for (let page = 0; page < 8; page++) component.handleInput("PAGE_UP");
+						selections.push({ title: pages.join("\n"), options: ["Cancel", "Edit scope", "Approve and start"] });
+						resolveSelection = (choice) => {
+							if (choice === undefined) { component.handleInput("ESC"); return; }
+							for (let index = 0; index < ["Cancel", "Edit scope", "Approve and start"].indexOf(choice); index++) component.handleInput("DOWN");
+							component.handleInput("ENTER");
+						};
+					}
 				});
 			},
 			editor(title: string, prefill?: string) {
@@ -108,6 +157,7 @@ async function loadPicker(mode = "rpc") {
 		},
 	};
 	const api = {
+		sendMessage: (message: any, options: any) => sentMessages.push({ message, options }),
 		getAllTools: () => [...tools.values()],
 		appendEntry: (customType: string, data: unknown) => branch.push({ type: "custom", customType, data }),
 		registerTool(value: any) {
@@ -140,6 +190,8 @@ async function loadPicker(mode = "rpc") {
 		tools,
 		commands,
 		confirmCalls,
+		statuses, selections, sentMessages, credentialCatalog,
+		resolveSelection: (choice: string | undefined) => resolveSelection?.(choice),
 		resolveConfirm: (isApproved: boolean) => resolveConfirm?.(isApproved),
 		ctx,
 		api,
@@ -806,18 +858,27 @@ function autonomousScope() {
 	return {
 		taskId: "picker-task", scope: "Update the picker", protectedActions: [],
 		principleSources: ["ask-user-question.ts"], expiresAt: new Date(Date.now() + 60_000).toISOString(),
+		preparation: { decisions: ["Update the picker only"], credentials: [] as string[], accessChecks: ["No external access required"] },
 	};
 }
 
+async function prepareMode(picker: Awaited<ReturnType<typeof loadPicker>>) {
+	await picker.tools.get("autonomous_mode").execute("prepare", { action: "prepare" }, undefined, undefined, picker.ctx);
+	const previous = picker.component();
+	const pending = picker.tool.execute("grill", { question: "What outcome and limits should this task have?" }, undefined, undefined, picker.ctx);
+	const component = await waitForComponent(() => picker.component() !== previous ? picker.component() : undefined);
+	component.handleInput("Update the picker only; no external access.");
+	component.handleInput("ENTER");
+	assert.equal((await pending).details.provenance, "interactive-user");
+}
+
 async function approveMode(picker: Awaited<ReturnType<typeof loadPicker>>, scope = autonomousScope()) {
-	const editorCount = picker.editorCalls.length;
-	const confirmCount = picker.confirmCalls.length;
+	await prepareMode(picker);
+	const count = picker.selections.length;
 	const pending = picker.tools.get("autonomous_mode").execute("enable", { action: "on", scope }, undefined, undefined, picker.ctx);
-	await waitForComponent(() => picker.editorCalls.length > editorCount ? picker.editorCalls : undefined);
-	picker.resolveEditor(JSON.stringify(scope));
-	await waitForComponent(() => picker.confirmCalls.length > confirmCount ? picker.confirmCalls : undefined);
-	assert.match(picker.confirmCalls.at(-1)!.message, /not execution authorization/);
-	picker.resolveConfirm(true);
+	await waitForComponent(() => picker.selections.length > count ? true : undefined);
+	assert.match(picker.selections.at(-1)!.title, /not execution authorization/);
+	picker.resolveSelection("Approve and start");
 	return pending;
 }
 
@@ -826,32 +887,35 @@ test("autonomous enablement and widening require human confirmation, not propose
 	try {
 		const scope = autonomousScope();
 		const mode = picker.tools.get("autonomous_mode");
-		const pending = mode.execute("enable", { action: "on", scope: { ...scope, isApproved: true } }, undefined, undefined, picker.ctx);
-		await waitForComponent(() => picker.editorCalls[0]);
-		assert.equal((await mode.execute("status", { action: "status" }, undefined, undefined, picker.ctx)).details.isActive, false);
-		picker.resolveEditor(JSON.stringify(scope));
-		await waitForComponent(() => picker.confirmCalls[0]);
-		picker.resolveConfirm(false);
+		const unprepared = await mode.execute("enable", { action: "on", scope: { ...scope, isApproved: true } }, undefined, undefined, picker.ctx);
+		assert.equal(unprepared.details.isActive, false);
+		assert.equal(unprepared.details.isPreparing, true);
+		assert.equal(picker.selections.length, 0);
+		await prepareMode(picker);
+		const pending = mode.execute("enable", { action: "on", scope }, undefined, undefined, picker.ctx);
+		await waitForComponent(() => picker.selections[0]);
+		assert.deepEqual(picker.selections[0].options, ["Cancel", "Edit scope", "Approve and start"]);
+		picker.resolveSelection("Cancel");
 		assert.equal((await pending).details.isActive, false);
+		assert.equal(picker.editorCalls.length, 0);
 		const approved = await approveMode(picker, scope);
 		assert.equal(approved.details.approval.provenance, "interactive-user");
 		assert.equal(approved.details.approval.expiresOn, "task_complete");
 		const wider = { ...scope, scope: "Update everything" };
-		const widening = mode.execute("widen", { action: "on", scope: wider }, undefined, undefined, picker.ctx);
-		await waitForComponent(() => picker.editorCalls.length === 3 ? true : undefined);
-		picker.resolveEditor(JSON.stringify(wider));
-		await waitForComponent(() => picker.confirmCalls.length === 3 ? true : undefined);
-		picker.resolveConfirm(false);
-		assert.equal((await widening).details.approval.approvalId, approved.details.approval.approvalId);
+		const widening = await mode.execute("widen", { action: "on", scope: wider }, undefined, undefined, picker.ctx);
+		assert.equal(widening.details.isActive, false);
+		assert.equal(widening.details.isPreparing, true);
+		assert.match(picker.statuses.get("autonomous")!, /Preparing/);
 	} finally { await picker.dispose(); }
 });
 
-test("autonomous guidance has provenance and no answers while secure, ambiguous and child RPC questions remain human", async () => {
+test("autonomous guidance is AI labeled while secure and essential-information questions remain human", async () => {
 	const picker = await loadPicker("tui");
 	try {
 		const scope = autonomousScope();
 		const approved = await approveMode(picker, scope);
 		const policy = { taskId: scope.taskId, scope: scope.scope, kind: "routine", isReversible: true };
+		const initialCount = picker.customCallCount();
 		const result = await picker.tool.execute("routine", {
 			question: "Choose an implementation?", policy, options: [{ label: "A" }, { label: "B" }],
 		}, undefined, undefined, picker.ctx);
@@ -859,9 +923,14 @@ test("autonomous guidance has provenance and no answers while secure, ambiguous 
 		assert.equal(result.details.provenance, "automatic-policy-guidance");
 		assert.equal(result.details.approvalId, approved.details.approval.approvalId);
 		assert.deepEqual(result.details.answers, []);
-		assert.equal(picker.customCallCount(), 0);
-		assert.match(picker.tool.renderResult(result, {}, { fg: (_name: string, text: string) => text }).text, /AUTOMATIC POLICY GUIDANCE/);
-		for (const params of [{ question: "Unclassified?" }, { question: "Secret?", policy, secure: true }]) {
+		assert.equal(picker.customCallCount(), initialCount);
+		assert.match(picker.tool.renderResult(result, {}, { fg: (_name: string, text: string) => text }).text, /AI auto-reply/);
+		const missing = await picker.tool.execute("missing", { question: "Unclassified?" }, undefined, undefined, picker.ctx);
+		assert.equal(missing.isError, true);
+		assert.deepEqual(missing.details.answers, []);
+		assert.match(missing.content[0].text, /AI ROUTING ERROR/);
+		assert.equal(picker.customCallCount(), initialCount);
+		for (const params of [{ question: "Information only you hold?", policy: { ...policy, kind: "information" } }, { question: "Secret?", policy, secure: true }]) {
 			const oldComponent = picker.component();
 			const pending = picker.tool.execute("interactive", params, undefined, undefined, picker.ctx);
 			const component = await waitForComponent(() => picker.component() !== oldComponent ? picker.component() : undefined);
@@ -873,11 +942,12 @@ test("autonomous guidance has provenance and no answers while secure, ambiguous 
 		const replies: any[] = [];
 		picker.api.events.on("ask-user-question:rpc:ask:reply:child", (payload) => replies.push(payload));
 		picker.api.events.emit("ask-user-question:rpc:ask", { requestId: "child", params: { question: "Child?", policy } });
-		const component = await waitForComponent(() => picker.component() !== oldComponent ? picker.component() : undefined);
-		component.handleInput("ENTER");
 		await waitForComponent(() => replies[0]);
-		assert.equal(replies[0].data.details.provenance, "interactive-user");
+		assert.equal(picker.component(), oldComponent);
+		assert.equal(replies[0].data.isError, true);
+		assert.equal(replies[0].data.details.provenance, "automatic-policy-guidance");
 		assert.equal(replies[0].data.details.approvalId, undefined);
+		assert.match(replies[0].data.content[0].text, /supervising agent/);
 	} finally { await picker.dispose(); }
 });
 
@@ -885,25 +955,49 @@ test("autonomous approval cannot survive task completion, lifecycle changes or p
 	const picker = await loadPicker("tui");
 	try {
 		const mode = picker.tools.get("autonomous_mode");
+		const noTask = await mode.execute("complete-missing", { action: "task_complete" }, undefined, undefined, picker.ctx);
+		assert.match(noTask.content[0].text, /requires the active taskId/);
 		await approveMode(picker);
 		const mismatch = await mode.execute("complete-other", { action: "task_complete", taskId: "other" }, undefined, undefined, picker.ctx);
 		assert.equal(mismatch.details.isActive, true);
 		const complete = await mode.execute("complete", { action: "task_complete", taskId: "picker-task" }, undefined, undefined, picker.ctx);
 		assert.equal(complete.details.isActive, false);
+		assert.equal(picker.statuses.get("autonomous"), "Autonomous · Complete");
 		for (const event of ["session_before_fork", "session_before_switch", "session_before_tree", "session_shutdown", "session_start"]) {
 			picker.lifecycleHandlers.get("session_start")?.({}, picker.ctx);
 			await approveMode(picker);
 			picker.lifecycleHandlers.get(event)?.({}, picker.ctx);
 			assert.equal((await mode.execute("status", { action: "status" }, undefined, undefined, picker.ctx)).details.isActive, false);
 		}
-		const count = picker.confirmCalls.length;
+		await prepareMode(picker);
+		const count = picker.selections.length;
 		const pending = mode.execute("late", { action: "on", scope: autonomousScope() }, undefined, undefined, picker.ctx);
-		await waitForComponent(() => picker.editorCalls.length > count ? true : undefined);
-		picker.resolveEditor(JSON.stringify(autonomousScope()));
-		await waitForComponent(() => picker.confirmCalls.length > count ? true : undefined);
+		await waitForComponent(() => picker.selections.length > count ? true : undefined);
 		await mode.execute("off", { action: "off" }, undefined, undefined, picker.ctx);
-		picker.resolveConfirm(true);
+		picker.resolveSelection("Approve and start");
 		assert.equal((await pending).details.isActive, false);
+	} finally { await picker.dispose(); }
+});
+
+test("ungranted credentials block start until the credential broker verifies access", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		await prepareMode(picker);
+		const mode = picker.tools.get("autonomous_mode");
+		const scope = autonomousScope();
+		scope.preparation.credentials = ["tracker"];
+		picker.credentialCatalog.credentials.push({ name: "tracker", isGranted: false });
+		const blocked = await mode.execute("blocked", { action: "on", scope }, undefined, undefined, picker.ctx);
+		assert.equal(blocked.details.isActive, false);
+		assert.match(blocked.content[0].text, /not verified as granted: tracker/);
+		assert.equal(picker.selections.length, 0);
+		picker.credentialCatalog.credentials[0].isGranted = true;
+		const pending = mode.execute("ready", { action: "on", scope }, undefined, undefined, picker.ctx);
+		await waitForComponent(() => picker.selections[0]);
+		assert.match(picker.selections[0].title, /Credentials: tracker/);
+		picker.resolveSelection("Edit scope");
+		assert.equal((await pending).details.isActive, false);
+		assert.match(picker.statuses.get("autonomous")!, /Preparing/);
 	} finally { await picker.dispose(); }
 });
 
@@ -911,24 +1005,20 @@ test("autonomous command approval refuses expired scopes and unreadable sources 
 	const picker = await loadPicker("tui");
 	try {
 		const command = picker.commands.get("autonomous");
+		await command.handler("on", picker.ctx);
+		assert.match(picker.sentMessages[0].message.content, /grill session/);
+		assert.equal(picker.sentMessages[0].options.triggerTurn, true);
+		await prepareMode(picker);
+		const mode = picker.tools.get("autonomous_mode");
 		for (const scope of [
 			{ ...autonomousScope(), expiresAt: "2000-01-01T00:00:00Z" },
 			{ ...autonomousScope(), principleSources: ["missing-owner-file.md"] },
 		]) {
-			const count = picker.editorCalls.length;
-			const pending = command.handler("on", picker.ctx);
-			await waitForComponent(() => picker.editorCalls.length > count ? true : undefined);
-			picker.resolveEditor(JSON.stringify(scope));
-			await pending;
-			assert.equal(picker.confirmCalls.length, 0);
+			const result = await mode.execute("invalid", { action: "on", scope }, undefined, undefined, picker.ctx);
+			assert.equal(result.details.isActive, false);
+			assert.equal(picker.selections.length, 0);
 		}
-		const count = picker.editorCalls.length;
-		const pending = command.handler("on", picker.ctx);
-		await waitForComponent(() => picker.editorCalls.length > count ? true : undefined);
-		picker.resolveEditor(JSON.stringify(autonomousScope()));
-		await waitForComponent(() => picker.confirmCalls[0]);
-		picker.resolveConfirm(true);
-		await pending;
+		await approveMode(picker);
 		await command.handler("status", picker.ctx);
 		assert.match(picker.notices.at(-1)!, /Autonomous policy guidance is on/);
 		await command.handler("off", picker.ctx);
@@ -1006,6 +1096,35 @@ test("an open autonomous task continues after a final answer until matching task
 		await mode.execute("complete", { action: "task_complete", taskId: "picker-task" }, undefined, undefined, picker.ctx);
 		assert.equal(await settle(picker), undefined);
 	} finally { await picker.dispose(); }
+});
+
+test("exhausted connection retries resume only while autonomous approval remains active", async (t) => {
+	const picker = await loadPicker("tui");
+	try {
+		await approveMode(picker);
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const failed = () => {
+			picker.lifecycleHandlers.get("message_end")?.({ message: { role: "assistant", stopReason: "error", errorMessage: "Retry failed after 10 attempts: Connection error." } }, picker.ctx);
+			picker.lifecycleHandlers.get("agent_settled")?.({ aborted: false }, picker.ctx);
+		};
+		failed();
+		assert.match(picker.statuses.get("autonomous")!, /Connection retry/);
+		t.mock.timers.tick(29_999);
+		assert.equal(picker.sentMessages.length, 0);
+		t.mock.timers.tick(1);
+		assert.equal(picker.sentMessages.length, 1);
+		assert.equal(picker.sentMessages[0].message.customType, "autonomous-connection-retry");
+		assert.equal(picker.sentMessages[0].options.triggerTurn, true);
+		failed();
+		t.mock.timers.tick(30_000);
+		assert.equal(picker.sentMessages.length, 1);
+		await picker.tools.get("autonomous_mode").execute("off", { action: "off" }, undefined, undefined, picker.ctx);
+		t.mock.timers.tick(300_000);
+		assert.equal(picker.sentMessages.length, 1);
+		failed();
+		t.mock.timers.tick(300_000);
+		assert.equal(picker.sentMessages.length, 1);
+	} finally { t.mock.timers.reset(); await picker.dispose(); }
 });
 
 test("live native jobs including omitted entries permit waiting without another wake owner", async () => {
