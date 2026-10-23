@@ -84,7 +84,9 @@ It does not use global workspace allocations or add another task tracker.
 Waiting for native subagents is allowed. The extension reads current-session status through the documented pi-subagents event-bus RPC(remote procedure call).
 It checks the ping capabilities and the versioned fleet response, including `totalActive` and omitted entries.
 Native completion wakes and bounded supervisor reminders keep their own ownership. This extension adds no polling, heartbeat, or wake subscription.
-It does not restart user aborts or provider errors. Native exhausted-reminder entries revoke automation and report a blocker without marking the task complete.
+It does not restart user aborts. After host retries end with a connection error, active autonomy retries after 30 seconds. Repeated failures double the wait up to five minutes. The footer shows the retry time and `/autonomous off`. User input cancels the pending retry. Revocation, task completion, session changes, and expiry also cancel it. Recovery carries an AI label, grants no new authority, and keeps the selected model. Other provider errors keep their existing behavior.
+
+Native exhausted-reminder entries revoke automation and report a blocker without marking the task complete.
 A passive settlement observer handles those entries even when the native hook runs later.
 
 Pi-subagents is not a required dependency. Absence requires a bounded ping with no responder, no native tools in Pi's configured tool registry, no ready advertisement, and no unresolved native notice.

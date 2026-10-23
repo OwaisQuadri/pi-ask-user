@@ -994,8 +994,18 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	let preparationAnswers = 0;
 	let expiryTimer: ReturnType<typeof setTimeout> | undefined;
 	let isNativeAdvertised = false;
+	let connectionError: string | undefined;
+	let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+	let recoveryAttempts = 0;
+	const cancelRecovery = () => {
+		clearTimeout(recoveryTimer);
+		recoveryTimer = undefined;
+		connectionError = undefined;
+	};
 	pi.events.on("subagents:rpc:v1:ready", () => { isNativeAdvertised = true; });
 	const expireApproval = () => {
+		cancelRecovery();
+		recoveryAttempts = 0;
 		clearTimeout(expiryTimer);
 		approval = undefined;
 		isPreparing = false;
@@ -1077,13 +1087,42 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			continue: true,
 		};
 	});
-	pi.on("agent_settled", (_event, ctx) => {
+	pi.on("message_end", (event, ctx) => {
+		if (!currentApproval(ctx) || event.message.role !== "assistant") return;
+		connectionError = event.message.stopReason === "error" && /connection error/i.test(event.message.errorMessage ?? "")
+			? event.message.errorMessage : undefined;
+		if (event.message.stopReason !== "error") recoveryAttempts = 0;
+	});
+	pi.on("input", () => {
+		cancelRecovery();
+		if (activeContext) refreshStatus(activeContext);
+	});
+	pi.on("agent_start", cancelRecovery);
+	pi.on("agent_settled", (event, ctx) => {
 		const current = currentApproval(ctx);
 		if (!current) return;
 		if (isNativeExhausted(ctx, current)) {
 			const entry = revokeForBlocker(ctx, current, "Native reminder budget exhausted.");
 			pi.appendEntry(entry.customType, entry.details);
+			return;
 		}
+		if (event.aborted || !connectionError || recoveryTimer || ctx.hasPendingMessages()) return;
+		const revision = approvalRevision;
+		const delay = Math.min(30_000 * 2 ** Math.min(recoveryAttempts++, 4), 300_000);
+		const retryAt = Date.now() + delay;
+		if (retryAt >= Date.parse(current.expiresAt)) return;
+		refreshStatus(ctx, `Autonomous · Connection retry ${new Date(retryAt).toLocaleTimeString()} · /autonomous off`);
+		recoveryTimer = setTimeout(() => {
+			cancelRecovery();
+			if (currentApproval(ctx) !== current || approvalRevision !== revision || ctx.hasPendingMessages() || !ctx.isIdle()) return;
+			refreshStatus(ctx);
+			pi.sendMessage({
+				customType: "autonomous-connection-retry", display: true,
+				content: "AI AUTO-REPLY (artificial intelligence). The connection failed after the host retries ended. Continue the approved task from its recorded state. Check tool results before repeating any operation. This is not a human answer or new execution authority.",
+				details: { provenance: "automatic-policy-guidance", approvalId: current.approvalId, taskId: current.taskId },
+			}, { triggerTurn: true });
+		}, delay);
+		recoveryTimer.unref();
 	});
 
 	function refreshStatus(ctx: ExtensionContext, state?: string) {

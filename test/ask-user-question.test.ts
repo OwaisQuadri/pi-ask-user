@@ -108,6 +108,7 @@ async function loadPicker(mode = "rpc") {
 		cwd: root,
 		signal: undefined as AbortSignal | undefined,
 		hasPendingMessages: () => false,
+		isIdle: () => true,
 		tools: [{ name: "cred_list" }],
 		executeTool: async () => ({ result: { details: credentialCatalog }, isError: false }),
 		sessionManager: { getSessionId: () => "session-1", getBranch: () => branch },
@@ -1095,6 +1096,35 @@ test("an open autonomous task continues after a final answer until matching task
 		await mode.execute("complete", { action: "task_complete", taskId: "picker-task" }, undefined, undefined, picker.ctx);
 		assert.equal(await settle(picker), undefined);
 	} finally { await picker.dispose(); }
+});
+
+test("exhausted connection retries resume only while autonomous approval remains active", async (t) => {
+	const picker = await loadPicker("tui");
+	try {
+		await approveMode(picker);
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const failed = () => {
+			picker.lifecycleHandlers.get("message_end")?.({ message: { role: "assistant", stopReason: "error", errorMessage: "Retry failed after 10 attempts: Connection error." } }, picker.ctx);
+			picker.lifecycleHandlers.get("agent_settled")?.({ aborted: false }, picker.ctx);
+		};
+		failed();
+		assert.match(picker.statuses.get("autonomous")!, /Connection retry/);
+		t.mock.timers.tick(29_999);
+		assert.equal(picker.sentMessages.length, 0);
+		t.mock.timers.tick(1);
+		assert.equal(picker.sentMessages.length, 1);
+		assert.equal(picker.sentMessages[0].message.customType, "autonomous-connection-retry");
+		assert.equal(picker.sentMessages[0].options.triggerTurn, true);
+		failed();
+		t.mock.timers.tick(30_000);
+		assert.equal(picker.sentMessages.length, 1);
+		await picker.tools.get("autonomous_mode").execute("off", { action: "off" }, undefined, undefined, picker.ctx);
+		t.mock.timers.tick(300_000);
+		assert.equal(picker.sentMessages.length, 1);
+		failed();
+		t.mock.timers.tick(300_000);
+		assert.equal(picker.sentMessages.length, 1);
+	} finally { t.mock.timers.reset(); await picker.dispose(); }
 });
 
 test("live native jobs including omitted entries permit waiting without another wake owner", async () => {
