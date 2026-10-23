@@ -13,6 +13,11 @@ export interface AutonomousScope {
 	protectedActions: ProtectedAction[];
 	principleSources: string[];
 	expiresAt: string;
+	preparation: {
+		decisions: string[];
+		credentials: string[];
+		accessChecks: string[];
+	};
 }
 
 export interface AutonomousApproval extends AutonomousScope {
@@ -26,7 +31,7 @@ export interface AutonomousApproval extends AutonomousScope {
 export interface QuestionPolicy {
 	taskId: string;
 	scope: string;
-	kind: "routine" | "protected" | "approval";
+	kind: "routine" | "protected" | "approval" | "information";
 	isReversible?: boolean;
 	protectedAction?: ProtectedAction;
 }
@@ -47,12 +52,16 @@ export function isAutonomousScope(value: unknown): value is AutonomousScope {
 	return isRecord(value) && isNonblank(value.taskId) && isNonblank(value.scope)
 		&& Array.isArray(value.protectedActions) && value.protectedActions.every(isProtectedAction)
 		&& Array.isArray(value.principleSources) && value.principleSources.length > 0 && value.principleSources.every(isNonblank)
-		&& typeof value.expiresAt === "string" && Number.isFinite(Date.parse(value.expiresAt));
+		&& typeof value.expiresAt === "string" && Number.isFinite(Date.parse(value.expiresAt))
+		&& isRecord(value.preparation)
+		&& Array.isArray(value.preparation.decisions) && value.preparation.decisions.length > 0 && value.preparation.decisions.every(isNonblank)
+		&& Array.isArray(value.preparation.credentials) && value.preparation.credentials.every(isNonblank)
+		&& Array.isArray(value.preparation.accessChecks) && value.preparation.accessChecks.length > 0 && value.preparation.accessChecks.every(isNonblank);
 }
 
 export function isQuestionPolicy(value: unknown): value is QuestionPolicy {
 	if (!isRecord(value) || !isNonblank(value.taskId) || !isNonblank(value.scope)) return false;
-	if (value.kind === "approval") return true;
+	if (value.kind === "approval" || value.kind === "information") return true;
 	if (value.kind === "routine") return value.isReversible === true && value.protectedAction === undefined;
 	return value.kind === "protected" && isProtectedAction(value.protectedAction);
 }
@@ -65,8 +74,13 @@ export function guidanceForQuestion(
 	now = Date.now(),
 ): string | undefined {
 	if (!approval || isSecure || approval.sessionId !== sessionId || Date.parse(approval.expiresAt) <= now) return;
-	if (!isQuestionPolicy(policy) || policy.taskId !== approval.taskId || policy.scope !== approval.scope) return;
-	if (policy.kind === "approval") return;
+	if (!isQuestionPolicy(policy) || policy.taskId !== approval.taskId || policy.scope !== approval.scope) {
+		return [guidanceEnvelope(approval),
+			"AI ROUTING ERROR: No human was asked. Missing or mismatched task metadata does not grant authority.",
+			"Resolve routine decisions within the approved task. If only the user can supply essential information, retry with kind information. For new authority or expanded scope, retry with kind approval. Never guess consent.",
+		].join("\n");
+	}
+	if (policy.kind === "approval" || policy.kind === "information") return;
 	if (policy.kind === "protected" && !approval.protectedActions.some((allowed) =>
 		allowed.action === policy.protectedAction!.action && allowed.target === policy.protectedAction!.target
 		&& allowed.bounds === policy.protectedAction!.bounds,
@@ -81,7 +95,7 @@ export function guidanceForQuestion(
 
 function guidanceEnvelope(approval: AutonomousApproval): string {
 	return [
-		"AUTOMATIC POLICY GUIDANCE. This is not a human answer, selected option, or new approval.",
+		"AI AUTO-REPLY (artificial intelligence). AUTOMATIC POLICY GUIDANCE. This is not a human answer, selected option, or new approval.",
 		`Approval ID: ${approval.approvalId}. Authority: interactive user in this session only.`,
 		`Owning session: ${approval.sessionId}. Approval provenance: ${approval.provenance}.`,
 		`Task: ${approval.taskId}. Scope: ${approval.scope}.`,
