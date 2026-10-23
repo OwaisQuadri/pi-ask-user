@@ -40,7 +40,9 @@ The final sheet shows the task, settled decisions, access checks, credential nam
 
 The `autonomous_mode` tool accepts `action: "prepare"`, `"on"`, `"off"`, `"status"`, or `"task_complete"`.
 Use `prepare` for the interview and access checks, then `on` with the settled scope. At least one nonsecret human answer must be collected during preparation before the approval sheet can open. Proposals never grant authority.
-Preparing a replacement or wider scope revokes the previous approval. Cancellation leaves autonomy off.
+An agent cannot revoke active approval with `off`, `prepare`, or `on`. To replace the scope, the user first runs `/autonomous off`, then starts preparation again. Cancellation during preparation leaves autonomy off.
+
+Identify foreseeable approvals, recovery choices, budgets, and stop conditions during preparation. Make reversible decisions within the approved scope, keep the evidence and reversal steps, and report them afterwards.
 
 Use the existing credential controls for registration and grants, including owner authentication with Touch ID. Put commands that the user must run in normal chat, not a question dialog. Do not perform an operation with side effects just to trigger a grant.
 Before the final sheet, the extension checks required credential names through `cred_list` and refuses unverified or ungranted credentials. Other access checks remain agent-reported evidence for human review. Per-use authentication still applies; preparation cannot preapprove future privileged commands.
@@ -69,7 +71,7 @@ It is not restored from conversation history or inherited by another session.
 Switching, forking, navigating the conversation tree, shutdown, or reload clears it.
 
 The host has no task-completion event. Close the task explicitly with `autonomous_mode` and `{ "action": "task_complete", "taskId": "the-approved-task-id" }`.
-`/autonomous off` also revokes approval. For a real blocker, use `autonomous_mode` with `action: "off"` and report the blocker, not task completion.
+Only the user can revoke approval with `/autonomous off`. An agent `off` call leaves approval unchanged. For a real blocker, report the evidence and recovery path, keep the task open, and continue unaffected authorized work. Use `task_complete` only after verified completion, not to avoid a blocker.
 The time bound expires even if the caller omits task completion.
 A normal agent turn ending does not imply task completion.
 
@@ -86,12 +88,12 @@ It checks the ping capabilities and the versioned fleet response, including `tot
 Native completion wakes and bounded supervisor reminders keep their own ownership. This extension adds no polling, heartbeat, or wake subscription.
 It does not restart user aborts. After host retries end with a connection error, active autonomy retries after 30 seconds. Repeated failures double the wait up to five minutes. The footer shows the retry time and `/autonomous off`. User input cancels the pending retry. Revocation, task completion, session changes, and expiry also cancel it. Recovery carries an AI label, grants no new authority, and keeps the selected model. Other provider errors keep their existing behavior.
 
-Native exhausted-reminder entries revoke automation and report a blocker without marking the task complete.
+Native exhausted-reminder entries report a blocker without revoking approval or marking the task complete.
 A passive settlement observer handles those entries even when the native hook runs later.
 
 Pi-subagents is not a required dependency. Absence requires a bounded ping with no responder, no native tools in Pi's configured tool registry, no ready advertisement, and no unresolved native notice.
 With evidence of native integration, missing RPC, unsupported capabilities, malformed replies, or a status timeout are compatibility blockers, not an empty queue.
-Each RPC request has a five-second limit and no retry. A blocker revokes approval with an explicit diagnostic; it never closes the task.
+Each RPC request has a five-second limit and no retry. A blocker reports an explicit diagnostic and suspends automatic continuation for that boundary; it neither revokes approval nor closes the task.
 Approval, session identity, pending input, and abort state are checked again after asynchronous reads.
 Status reads are observational, not an atomic transaction with another extension's completion wake.
 
@@ -125,7 +127,7 @@ Human answers use `provenance: "interactive-user"`.
 
 During active autonomy, missing or mismatched metadata returns an **AI ROUTING ERROR** tool error without opening a user dialog. The agent must resolve routine work or retry with the exact task metadata and an appropriate human-input kind. A routing error never grants authority.
 Secure fields, matching approval and essential-information questions, and unmatched protected actions remain interactive. Without active approval, ordinary question behavior is unchanged.
-Nonsecure child RPC questions during active autonomy receive an AI routing error that directs them to their supervisor. No approval record is sent to the child. Outside active autonomy, child questions keep their existing interactive route.
+Routine child RPC questions during active autonomy receive an AI routing error that directs them to their supervisor. Approval, essential-information, and secure child questions remain interactive. No approval record is sent to the child. Outside active autonomy, child questions keep their existing interactive route.
 RPC and child instances cannot enable the mode or receive the owning session's approval.
 Use the owning terminal session explicitly for approval; this extension does not infer ownership from `hasUI` alone.
 

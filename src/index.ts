@@ -1033,14 +1033,13 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		activeContext = undefined;
 	});
 
-	function revokeForBlocker(ctx: ExtensionContext, current: AutonomousApproval, reason: string): CustomMessageEntryDraft {
-		expireApproval();
-		const content = `AUTONOMOUS BLOCKER: ${reason} Automation revoked; task ${current.taskId} is not marked complete.`;
+	function reportBlocker(ctx: ExtensionContext, current: AutonomousApproval, reason: string): CustomMessageEntryDraft {
+		const content = `AUTONOMOUS BLOCKER: ${reason} Approval remains active; task ${current.taskId} is not marked complete. Continue unaffected authorized work and report the evidence and recovery path.`;
 		refreshStatus(ctx, "Autonomous · Blocked");
 		ctx.ui.notify(content, "error");
 		return {
 			type: "custom_message", customType: "autonomous-blocked", display: true, content,
-			details: { provenance: "automatic-policy-guidance", approvalId: current.approvalId, taskId: current.taskId, isActive: false, isTaskComplete: false, reason },
+			details: { provenance: "automatic-policy-guidance", approvalId: current.approvalId, taskId: current.taskId, isActive: true, isTaskComplete: false, reason },
 		};
 	}
 	const isNativeBlocker = (customType: string) => customType === "subagent-supervisor-blocked"
@@ -1059,7 +1058,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		if (!isCurrent()) return;
 		if (isNativeExhausted(ctx, current)
 			|| event.entries.some((entry) => entry.type === "custom_message" && isNativeBlocker(entry.customType))) {
-			return { entries: [...event.entries, revokeForBlocker(ctx, current, "Native reminder budget exhausted.")] };
+			return { entries: [...event.entries, reportBlocker(ctx, current, "Native reminder budget exhausted.")] };
 		}
 		if (event.continue || event.context.pendingMessages.length || ctx.hasPendingMessages()) return;
 		const messages = event.context.contextMessages;
@@ -1074,7 +1073,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		} catch (error) {
 			if (!isCurrent() || ctx.hasPendingMessages() || event.context.pendingMessages.length) return;
 			const reason = `Compatibility blocker: ${error instanceof Error ? error.message : "Native status unavailable."}`;
-			return { entries: [...event.entries, revokeForBlocker(ctx, current, reason)] };
+			return { entries: [...event.entries, reportBlocker(ctx, current, reason)] };
 		}
 		if (!isCurrent() || ctx.hasPendingMessages() || event.context.pendingMessages.length || event.continue
 			|| totalActive > 0 || isNativeReminderPending) return;
@@ -1102,7 +1101,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		const current = currentApproval(ctx);
 		if (!current) return;
 		if (isNativeExhausted(ctx, current)) {
-			const entry = revokeForBlocker(ctx, current, "Native reminder budget exhausted.");
+			const entry = reportBlocker(ctx, current, "Native reminder budget exhausted.");
 			pi.appendEntry(entry.customType, entry.details);
 			return;
 		}
@@ -1134,6 +1133,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 
 	function beginPreparation(ctx: ExtensionContext) {
 		if (!isOwningSession(ctx)) return modeResult(ctx, "Prepare autonomy in the owning interactive session.");
+		if (currentApproval(ctx)) return modeResult(ctx, "Approval remains active. Only the user can revoke it with /autonomous off before preparing a replacement scope.");
 		expireApproval();
 		isPreparing = true;
 		refreshStatus(ctx);
@@ -1141,7 +1141,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			"Autonomous preparation only. No autonomous approval is active.",
 			"Start a grill session with the user. Ask one question at a time with ask_user_question. Settle the outcome, acceptance checks, exclusions, limits, and completion condition. Investigate available facts yourself.",
 			"Identify required credentials and permissions. Use cred_list to check metadata, never secret values. Resolve missing credentials through cred_ask and grants through the existing credential controls, including owner Touch ID. Put any /cred grant command in normal chat, not in a question dialog. Do not perform a side-effectful operation merely to trigger a grant.",
-			"Complete safe access checks and record remaining per-use approvals honestly. Never mark an ungranted credential or denied permission ready. If no access is required, record that explicitly.",
+			"Identify foreseeable approvals, recovery choices, budgets, and stop conditions before start. Complete safe access checks and record remaining per-use approvals honestly. Never mark an ungranted credential or denied permission ready. If no access is required, record that explicitly.",
 			"When the interview and access preparation are complete, call autonomous_mode on with the settled scope and preparation summary. The user must choose Approve and start. Do not change dreaming.",
 		].join("\n"));
 	}
@@ -1261,7 +1261,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "autonomous_mode",
 		label: "Autonomous mode",
-		description: "Prepare autonomous work with a human grill session and credential/permission checks first (action prepare). Ask one scope question at a time. Complete needed grants with the existing credential controls and Touch ID. Then request human approval with action on and a settled scope/preparation summary. Never approves itself. Use off for blockers and matching task_complete for completion. Do not change dreaming.",
+		description: "Prepare autonomous work with a human grill session and credential/permission checks first (action prepare). Ask one scope question at a time. Complete needed grants with the existing credential controls and Touch ID. Then request human approval with action on and a settled scope/preparation summary. Never approves itself. Blockers do not revoke approval. Only the user can stop with /autonomous off. Use matching task_complete only after verified completion. Do not change dreaming.",
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("prepare"), Type.Literal("on"), Type.Literal("off"), Type.Literal("status"), Type.Literal("task_complete")]),
 			scope: Type.Optional(AutonomousScopeSchema),
@@ -1269,11 +1269,12 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		}, { additionalProperties: false }),
 		async execute(_id, params, signal, _update, ctx) {
 			if (params.action === "prepare") return beginPreparation(ctx);
+			if (params.action === "off") return modeResult(ctx, "Agent revocation is not permitted. Approval is unchanged. Report evidenced blockers and continue unaffected authorized work. Only the user can stop with /autonomous off.");
 			if (params.action === "on") return enableMode(ctx, params.scope, signal);
 			if (params.action === "task_complete" && (!currentApproval(ctx) || params.taskId !== currentApproval(ctx)?.taskId)) {
 				return modeResult(ctx, "task_complete requires the active taskId.");
 			}
-			if ((params.action === "off" || params.action === "task_complete") && isOwningSession(ctx)) {
+			if (params.action === "task_complete" && isOwningSession(ctx)) {
 				expireApproval();
 				if (params.action === "task_complete") {
 					refreshStatus(ctx, "Autonomous · Complete");
@@ -1325,7 +1326,8 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			if (request.signal !== undefined && !isAbortSignal(request.signal)) throw new Error("Invalid ask_user_question abort signal");
 			const context = activeContext;
 			const data = await executeQuestion(pi, request.params, request.signal, context, () => activeContext === context, () => {
-				if (!currentApproval(context) || request.params.secure) return undefined;
+				if (!currentApproval(context) || request.params.secure
+					|| request.params.policy?.kind === "approval" || request.params.policy?.kind === "information") return undefined;
 				return {
 					text: "AI AUTO-REPLY (artificial intelligence). AI ROUTING ERROR: No human was asked. Send this decision to your supervising agent through its existing supervisor channel. You receive no autonomous approval or execution authority. The supervisor must resolve routine work or request human approval for a new boundary.",
 					isError: true,
