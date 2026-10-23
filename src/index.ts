@@ -1,9 +1,10 @@
-import type { ExtensionAPI, ExtensionContext, CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
 import { randomBytes, randomUUID } from "node:crypto";
 import { access, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { guidanceForContinuation, guidanceForQuestion, nativeActiveWork, isAutonomousScope, isQuestionPolicy, type AutonomousApproval, type AutonomousScope } from "./autonomous.ts";
 import { tmpdir } from "node:os";
+import { showApproval } from "./approval.ts";
 import { join, resolve } from "node:path";
 import {
 	Editor,
@@ -1089,7 +1090,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		if (!isOwningSession(ctx)) return;
 		const current = currentApproval(ctx);
 		ctx.ui.setStatus("autonomous", state || (isPreparing ? "Autonomous · Preparing scope and access"
-			: current ? `Autonomous · Running · ${current.scope.replace(/\s+/g, " ")} · /autonomous off` : undefined));
+			: current ? `Autonomous · Running · /autonomous off · ${current.scope.replace(/\s+/g, " ")}` : undefined));
 	}
 
 	function beginPreparation(ctx: ExtensionContext) {
@@ -1110,13 +1111,13 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		const current = currentApproval(ctx);
 		return {
 			content: [{ type: "text" as const, text: message || (current
-				? `Autonomous policy guidance is on.\n${JSON.stringify(current, null, 2)}`
-				: "Autonomous policy guidance is off.") }],
+				? `Autonomous policy guidance is on.\nTask: ${current.scope}\nEnds at task completion or ${new Date(current.expiresAt).toLocaleString()}.\nStop: /autonomous off`
+				: isPreparing ? "Preparing autonomous scope and access. Approval is not yet active." : "Autonomous policy guidance is off.") }],
 			details: { isActive: !!current, isPreparing, approval: current, message },
 		};
 	}
 
-	async function enableMode(ctx: ExtensionContext, proposed: AutonomousScope | undefined, signal?: AbortSignal) {
+	async function enableMode(ctx: ExtensionToolContext, proposed: AutonomousScope | undefined, signal?: AbortSignal) {
 		if (!isOwningSession(ctx)) return modeResult(ctx, "Enable autonomous mode in the owning interactive TUI session. Child and RPC sessions cannot inherit approval.");
 		const revision = approvalRevision;
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -1142,7 +1143,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 				if (reviewed.preparation.credentials.length) {
 					if (!ctx.tools.some(({ name }) => name === "cred_list")) return modeResult(ctx, "Credential checks unavailable. Complete access preparation before starting.");
 					const listing = await ctx.executeTool("cred_list", {}, { signal });
-					const catalog = listing.details as { credentials?: Array<{ name: string; isGranted: boolean }> } | undefined;
+					const catalog = listing.result.details as { credentials?: Array<{ name: string; isGranted: boolean }> } | undefined;
 					const missing = reviewed.preparation.credentials.filter((name) => !catalog?.credentials?.some((item) => item.name === name && item.isGranted === true));
 					if (listing.isError || missing.length) return modeResult(ctx, `Access preparation blocked. Required credentials are not verified as granted: ${missing.join(", ") || "credential listing failed"}. Use the existing credential grant flow with owner authentication, then retry.`);
 				}
@@ -1156,8 +1157,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 				}
 				if (!isCurrent()) return modeResult(ctx, "Autonomous approval request expired.");
 				refreshStatus(ctx, "Autonomous · Needs approval");
-				const choice = await ctx.ui.select([
-					"Approve autonomous work",
+				const choice = await showApproval(ctx, [
 					`Task: ${reviewed.scope}`,
 					`Scope decisions:\n${reviewed.preparation.decisions.map((item) => `  • ${item}`).join("\n")}`,
 					`Access:\n${reviewed.preparation.accessChecks.map((item) => `  • ${item}`).join("\n")}`,
@@ -1166,7 +1166,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 					`Ends: task completion or ${new Date(reviewed.expiresAt).toLocaleString()}`,
 					`Principle sources: ${reviewed.principleSources.join(", ")}`,
 					"Approval is not execution authorization. Credentials, native permissions, and human-only merges keep their own controls.",
-				].join("\n\n"), ["Cancel", "Edit scope", "Approve and start"], { signal });
+				].join("\n\n"), signal);
 				if (!isCurrent() || Date.parse(reviewed.expiresAt) <= Date.now()) return modeResult(ctx, "Autonomous approval expired or was cancelled.");
 				if (choice === "Edit scope") return modeResult(ctx, "Return to the grill session. Ask which scope or access detail to change, then present the revised approval sheet.");
 				if (choice !== "Approve and start") {
@@ -1212,7 +1212,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 				pi.sendMessage({ customType: "autonomous-preparation", content: preparation.content[0].text, display: true }, { triggerTurn: true });
 				return;
 			}
-			const result = action === "on" ? await enableMode(ctx, undefined)
+			const result = action === "on" ? modeResult(ctx, "Prepare autonomy in the owning interactive session.")
 				: action === "off" || action === "status" ? modeResult(ctx)
 				: modeResult(ctx, "Usage: /autonomous on|off|status");
 			ctx.ui.notify(result.content[0].text, "info");
@@ -1231,10 +1231,16 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		async execute(_id, params, signal, _update, ctx) {
 			if (params.action === "prepare") return beginPreparation(ctx);
 			if (params.action === "on") return enableMode(ctx, params.scope, signal);
-			if (params.action === "task_complete" && params.taskId !== currentApproval(ctx)?.taskId) {
+			if (params.action === "task_complete" && (!currentApproval(ctx) || params.taskId !== currentApproval(ctx)?.taskId)) {
 				return modeResult(ctx, "task_complete requires the active taskId.");
 			}
-			if ((params.action === "off" || params.action === "task_complete") && isOwningSession(ctx)) expireApproval();
+			if ((params.action === "off" || params.action === "task_complete") && isOwningSession(ctx)) {
+				expireApproval();
+				if (params.action === "task_complete") {
+					refreshStatus(ctx, "Autonomous · Complete");
+					return modeResult(ctx, "Autonomous task complete.");
+				}
+			}
 			return modeResult(ctx);
 		},
 	});

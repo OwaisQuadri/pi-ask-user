@@ -8,12 +8,30 @@ import { test } from "node:test";
 const extensionPath = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 
 const tuiModule = `
-export const Key = { up: "UP", down: "DOWN", enter: "ENTER", space: "SPACE", backspace: "BACKSPACE", escape: "ESC", ctrl: (key) => "CTRL_" + key };
+export const Key = { up: "UP", down: "DOWN", enter: "ENTER", space: "SPACE", backspace: "BACKSPACE", escape: "ESC", pageUp: "PAGE_UP", pageDown: "PAGE_DOWN", ctrl: (key) => "CTRL_" + key };
 export const getNativeClipboard = () => globalThis.__askClipboard;
 export const matchesKey = (data, key) => data === key;
 export const truncateToWidth = (text) => text;
 export const wrapTextWithAnsi = (text) => [text];
-export class Text { constructor(text) { this.text = text; } }
+export class Text { constructor(text) { this.text = text; } render() { return this.text.split("\\n"); } invalidate() {} }
+export class ScrollView {
+	constructor(child) { this.child = child; this.scrollTop = 0; this.max = 0; }
+	render(width) { return this.child.render(width); }
+	updateLayout(total, height) { this.max = Math.max(0, total - height); this.scrollTop = Math.min(this.scrollTop, this.max); }
+	scrollBy(lines) { this.scrollTop = Math.max(0, Math.min(this.max, this.scrollTop + lines)); }
+	invalidate() {}
+}
+export class SelectList {
+	constructor(items) { this.items = items; this.index = 0; }
+	render() { return this.items.map((item, index) => (index === this.index ? "→ " : "  ") + item.label); }
+	handleInput(key) {
+		if (key === "DOWN") this.index = (this.index + 1) % this.items.length;
+		if (key === "UP") this.index = (this.index + this.items.length - 1) % this.items.length;
+		if (key === "ENTER") this.onSelect?.(this.items[this.index]);
+		if (key === "ESC") this.onCancel?.();
+	}
+	invalidate() {}
+}
 export class Editor {
 	constructor() { this.text = ""; this.onSubmit = undefined; }
 	setText(text) { this.text = text; }
@@ -52,6 +70,7 @@ async function loadPicker(mode = "rpc") {
 	const root = await mkdtemp(join(tmpdir(), "ask-user-question-"));
 	await writeFile(join(root, "ask-user-question.ts"), await readFile(extensionPath));
 	await writeFile(join(root, "autonomous.ts"), await readFile(new URL("../src/autonomous.ts", import.meta.url)));
+	await writeFile(join(root, "approval.ts"), await readFile(new URL("../src/approval.ts", import.meta.url)));
 	await writeModule(root, "@earendil-works/pi-tui", tuiModule);
 	await writeModule(root, "typebox", typeboxModule);
 	await writeModule(root, "@earendil-works/pi-coding-agent", "");
@@ -90,7 +109,7 @@ async function loadPicker(mode = "rpc") {
 		signal: undefined as AbortSignal | undefined,
 		hasPendingMessages: () => false,
 		tools: [{ name: "cred_list" }],
-		executeTool: async () => ({ details: credentialCatalog, isError: false }),
+		executeTool: async () => ({ result: { details: credentialCatalog }, isError: false }),
 		sessionManager: { getSessionId: () => "session-1", getBranch: () => branch },
 		ui: {
 			setStatus(key: string, value: string | undefined) { statuses.set(key, value); },
@@ -108,7 +127,24 @@ async function loadPicker(mode = "rpc") {
 			custom(factory: any) {
 				customCallCount++;
 				return new Promise((resolve) => {
-					component = factory({ requestRender() {} }, theme, {}, resolve);
+					component = factory({ requestRender() {}, terminal: { rows: 24 } }, theme, {}, resolve);
+					if (component.render(80)[0] === "Approve autonomous work") {
+						const pages: string[] = [];
+						for (let page = 0; page < 8; page++) {
+							const lines = component.render(80);
+							assert.ok(lines.length <= 17);
+							assert.match(lines.join("\n"), /Approve and start/);
+							pages.push(lines.join("\n"));
+							component.handleInput("PAGE_DOWN");
+						}
+						for (let page = 0; page < 8; page++) component.handleInput("PAGE_UP");
+						selections.push({ title: pages.join("\n"), options: ["Cancel", "Edit scope", "Approve and start"] });
+						resolveSelection = (choice) => {
+							if (choice === undefined) { component.handleInput("ESC"); return; }
+							for (let index = 0; index < ["Cancel", "Edit scope", "Approve and start"].indexOf(choice); index++) component.handleInput("DOWN");
+							component.handleInput("ENTER");
+						};
+					}
 				});
 			},
 			editor(title: string, prefill?: string) {
@@ -918,11 +954,14 @@ test("autonomous approval cannot survive task completion, lifecycle changes or p
 	const picker = await loadPicker("tui");
 	try {
 		const mode = picker.tools.get("autonomous_mode");
+		const noTask = await mode.execute("complete-missing", { action: "task_complete" }, undefined, undefined, picker.ctx);
+		assert.match(noTask.content[0].text, /requires the active taskId/);
 		await approveMode(picker);
 		const mismatch = await mode.execute("complete-other", { action: "task_complete", taskId: "other" }, undefined, undefined, picker.ctx);
 		assert.equal(mismatch.details.isActive, true);
 		const complete = await mode.execute("complete", { action: "task_complete", taskId: "picker-task" }, undefined, undefined, picker.ctx);
 		assert.equal(complete.details.isActive, false);
+		assert.equal(picker.statuses.get("autonomous"), "Autonomous · Complete");
 		for (const event of ["session_before_fork", "session_before_switch", "session_before_tree", "session_shutdown", "session_start"]) {
 			picker.lifecycleHandlers.get("session_start")?.({}, picker.ctx);
 			await approveMode(picker);
