@@ -1269,7 +1269,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		}, { additionalProperties: false }),
 		async execute(_id, params, signal, _update, ctx) {
 			if (params.action === "prepare") return beginPreparation(ctx);
-			if (params.action === "off") return modeResult(ctx, "Agent revocation is not permitted. Approval is unchanged. Report genuine blockers and continue unaffected authorized work. Only the user can stop with /autonomous off.");
+			if (params.action === "off") return modeResult(ctx, "Agent revocation is not permitted. Approval is unchanged. Report evidenced blockers and continue unaffected authorized work. Only the user can stop with /autonomous off.");
 			if (params.action === "on") return enableMode(ctx, params.scope, signal);
 			if (params.action === "task_complete" && (!currentApproval(ctx) || params.taskId !== currentApproval(ctx)?.taskId)) {
 				return modeResult(ctx, "task_complete requires the active taskId.");
@@ -1326,7 +1326,8 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			if (request.signal !== undefined && !isAbortSignal(request.signal)) throw new Error("Invalid ask_user_question abort signal");
 			const context = activeContext;
 			const data = await executeQuestion(pi, request.params, request.signal, context, () => activeContext === context, () => {
-				if (!currentApproval(context) || request.params.secure) return undefined;
+				if (!currentApproval(context) || request.params.secure
+					|| request.params.policy?.kind === "approval" || request.params.policy?.kind === "information") return undefined;
 				return {
 					text: "AI AUTO-REPLY (artificial intelligence). AI ROUTING ERROR: No human was asked. Send this decision to your supervising agent through its existing supervisor channel. You receive no autonomous approval or execution authority. The supervisor must resolve routine work or request human approval for a new boundary.",
 					isError: true,

@@ -953,6 +953,22 @@ test("autonomous guidance is AI labeled while secure and essential-information q
 		assert.equal(replies[0].data.details.provenance, "automatic-policy-guidance");
 		assert.equal(replies[0].data.details.approvalId, undefined);
 		assert.match(replies[0].data.content[0].text, /supervising agent/);
+		for (const params of [
+			{ question: "Grant new authority?", policy: { ...policy, kind: "approval" } },
+			{ question: "User-held information?", policy: { ...policy, kind: "information" } },
+			{ question: "Secret?", secure: true },
+		]) {
+			const requestId = `human-${replies.length}`;
+			const previous = picker.component();
+			const humanReplies: any[] = [];
+			picker.api.events.on(`ask-user-question:rpc:ask:reply:${requestId}`, (payload) => humanReplies.push(payload));
+			picker.api.events.emit("ask-user-question:rpc:ask", { requestId, params });
+			const component = await waitForComponent(() => picker.component() !== previous ? picker.component() : undefined);
+			component.handleInput("human-input-value");
+			component.handleInput("ENTER");
+			await waitForComponent(() => humanReplies[0]);
+			assert.equal(humanReplies[0].data.details.provenance, "interactive-user");
+		}
 	} finally { await picker.dispose(); }
 });
 
