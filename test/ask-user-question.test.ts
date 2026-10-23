@@ -903,9 +903,14 @@ test("autonomous enablement and widening require human confirmation, not propose
 		assert.equal(approved.details.approval.expiresOn, "task_complete");
 		const wider = { ...scope, scope: "Update everything" };
 		const widening = await mode.execute("widen", { action: "on", scope: wider }, undefined, undefined, picker.ctx);
-		assert.equal(widening.details.isActive, false);
-		assert.equal(widening.details.isPreparing, true);
-		assert.match(picker.statuses.get("autonomous")!, /Preparing/);
+		assert.equal(widening.details.isActive, true);
+		assert.equal(widening.details.isPreparing, false);
+		assert.equal(widening.details.approval.approvalId, approved.details.approval.approvalId);
+		for (const action of ["off", "prepare"]) {
+			const refused = await mode.execute("refused", { action }, undefined, undefined, picker.ctx);
+			assert.equal(refused.details.approval.approvalId, approved.details.approval.approvalId);
+		}
+		assert.match(picker.statuses.get("autonomous")!, /Running/);
 	} finally { await picker.dispose(); }
 });
 
@@ -973,7 +978,7 @@ test("autonomous approval cannot survive task completion, lifecycle changes or p
 		const count = picker.selections.length;
 		const pending = mode.execute("late", { action: "on", scope: autonomousScope() }, undefined, undefined, picker.ctx);
 		await waitForComponent(() => picker.selections.length > count ? true : undefined);
-		await mode.execute("off", { action: "off" }, undefined, undefined, picker.ctx);
+		await picker.commands.get("autonomous").handler("off", picker.ctx);
 		picker.resolveSelection("Approve and start");
 		assert.equal((await pending).details.isActive, false);
 	} finally { await picker.dispose(); }
@@ -1118,7 +1123,7 @@ test("exhausted connection retries resume only while autonomous approval remains
 		failed();
 		t.mock.timers.tick(30_000);
 		assert.equal(picker.sentMessages.length, 1);
-		await picker.tools.get("autonomous_mode").execute("off", { action: "off" }, undefined, undefined, picker.ctx);
+		await picker.commands.get("autonomous").handler("off", picker.ctx);
 		t.mock.timers.tick(300_000);
 		assert.equal(picker.sentMessages.length, 1);
 		failed();
@@ -1168,7 +1173,10 @@ test("asynchronous native reads cannot revive revoked, replaced, expired, aborte
 			const pending = settle(picker);
 			await waitForComponent(() => heldRequest);
 			if (change === "off") await picker.commands.get("autonomous").handler("off", picker.ctx);
-			if (change === "replacement") await approveMode(picker);
+			if (change === "replacement") {
+				await picker.commands.get("autonomous").handler("off", picker.ctx);
+				await approveMode(picker);
+			}
 			if (change === "switch") picker.lifecycleHandlers.get("session_before_switch")?.({}, picker.ctx);
 			if (change === "session-id") picker.ctx.sessionManager.getSessionId = () => "other-session";
 			if (change === "expiry") approved.details.approval.expiresAt = "2000-01-01T00:00:00Z";
@@ -1181,7 +1189,7 @@ test("asynchronous native reads cannot revive revoked, replaced, expired, aborte
 	}
 });
 
-test("invalid native contracts revoke automation as a blocker, never as task completion", async () => {
+test("invalid native contracts report blockers without revoking approval or closing the task", async () => {
 	for (const fault of ["version", "correlation", "failure", "capability", "session", "fleet", "overflow"] as const) {
 		const picker = await loadPicker("tui");
 		try {
@@ -1204,8 +1212,8 @@ test("invalid native contracts revoke automation as a blocker, never as task com
 			assert.equal(result.continue, undefined, fault);
 			assert.match(result.entries[0].content, /Compatibility blocker/);
 			assert.equal(result.entries[0].details.isTaskComplete, false);
-			assert.equal((await modeStatus(picker)).details.isActive, false);
-			assert.equal(await settle(picker), undefined);
+			assert.equal(result.entries[0].details.isActive, true);
+			assert.equal((await modeStatus(picker)).details.isActive, true);
 		} finally { await picker.dispose(); }
 	}
 });
@@ -1225,7 +1233,7 @@ test("a host without native tools needs no dependency, but missing advertised RP
 			if (presence === "notice") event.context.contextMessages.push({ role: "custom", customType: "subagent-notify", content: "" });
 			const result = await settle(picker, event);
 			assert.equal(result.continue === true, presence === "absent");
-			assert.equal((await modeStatus(picker)).details.isActive, presence === "absent");
+			assert.equal((await modeStatus(picker)).details.isActive, true);
 			assert.equal(picker.emitted.filter(({ channel }) => channel === "subagents:rpc:v1:request").length, presence === "status-timeout" ? 2 : 1);
 		} finally { await picker.dispose(); }
 	}
@@ -1244,15 +1252,14 @@ test("native reminder ownership and later-hook exhaustion cannot be restarted by
 			const nativeEntry = { type: "custom_message", customType, timestamp: new Date().toISOString(), content: "", details: { blocked: true } };
 			picker.branch.push(nativeEntry);
 			picker.lifecycleHandlers.get("agent_settled")?.({}, picker.ctx);
-			assert.equal((await modeStatus(picker)).details.isActive, false);
+			assert.equal((await modeStatus(picker)).details.isActive, true);
 			assert.match(picker.notices.at(-1)!, /Native reminder budget exhausted/);
 			assert.equal(picker.branch.at(-1).data.isTaskComplete, false);
-			assert.equal(await settle(picker), undefined);
-			await approveMode(picker);
+			assert.equal((await settle(picker)).continue, undefined);
 			const composed = await settle(picker, { ...settleEvent(), entries: [nativeEntry] });
 			assert.equal(composed.continue, undefined);
 			assert.equal(composed.entries.at(-1).details.isTaskComplete, false);
-			assert.equal((await modeStatus(picker)).details.isActive, false);
+			assert.equal((await modeStatus(picker)).details.isActive, true);
 		} finally { await picker.dispose(); }
 	}
 });
