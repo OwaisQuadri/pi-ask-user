@@ -1034,7 +1034,13 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	});
 
 	function reportBlocker(ctx: ExtensionContext, current: AutonomousApproval, reason: string): CustomMessageEntryDraft {
-		const content = `AUTONOMOUS BLOCKER: ${reason} Approval remains active; task ${current.taskId} is not marked complete. Continue unaffected authorized work and report the evidence and recovery path.`;
+		const content = [
+			`AUTONOMOUS BLOCKER: ${reason}`,
+			`Phase: active. Approval remains active; task ${current.taskId} is not marked complete.`,
+			"Execution access: unchanged. Autonomous approval does not grant permissions or repair another guard.",
+			"Next actor: agent. Record the failed operation and its evidence. Continue unaffected authorized work.",
+			"Recovery: inspect the reported integration failure before proposing a remedy. No repair command has been verified by this message.",
+		].join("\n");
 		refreshStatus(ctx, "Autonomous · Blocked");
 		ctx.ui.notify(content, "error");
 		return {
@@ -1134,12 +1140,13 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	function beginPreparation(ctx: ExtensionContext) {
 		if (!isOwningSession(ctx)) return modeResult(ctx, "Prepare autonomy in the owning interactive session.");
 		if (currentApproval(ctx)) return modeResult(ctx, "Approval remains active. Only the user can revoke it with /autonomous off before preparing a replacement scope.");
+		if (isPreparing) return modeResult(ctx, "Preparation is already active. Keep the interview answers and completed access checks. Continue with the next unresolved requirement; do not restart the interview.");
 		expireApproval();
 		isPreparing = true;
 		refreshStatus(ctx);
 		return modeResult(ctx, [
 			"Autonomous preparation only. No autonomous approval is active.",
-			"Start a grill session with the user. Ask one question at a time with ask_user_question. Settle the outcome, acceptance checks, exclusions, limits, and completion condition. Investigate available facts yourself.",
+			"Next actor: agent. Start a grill session with the user. Ask one question at a time with ask_user_question. Settle the outcome, acceptance checks, exclusions, limits, and completion condition. Investigate available facts yourself.",
 			"Identify required credentials and permissions. Use cred_list to check metadata, never secret values. Resolve missing credentials through cred_ask and grants through the existing credential controls, including owner Touch ID. Put any /cred grant command in normal chat, not in a question dialog. Do not perform a side-effectful operation merely to trigger a grant.",
 			"Identify foreseeable approvals, recovery choices, budgets, and stop conditions before start. Complete safe access checks and record remaining per-use approvals honestly. Never mark an ungranted credential or denied permission ready. If no access is required, record that explicitly.",
 			"When the interview and access preparation are complete, call autonomous_mode on with the settled scope and preparation summary. The user must choose Approve and start. Do not change dreaming.",
@@ -1149,9 +1156,14 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	function modeResult(ctx: ExtensionContext, message?: string) {
 		const current = currentApproval(ctx);
 		return {
-			content: [{ type: "text" as const, text: message || (current
-				? `Autonomous policy guidance is on.\nTask: ${current.scope}\nEnds at task completion or ${new Date(current.expiresAt).toLocaleString()}.\nStop: /autonomous off`
-				: isPreparing ? "Preparing autonomous scope and access. Approval is not yet active." : "Autonomous policy guidance is off.") }],
+			content: [{ type: "text" as const, text: [
+				`Phase: ${current ? "active" : isPreparing ? "preparation" : "off"}. Autonomous approval: ${current ? "active" : "not active"}.`,
+				"Execution access: unchanged. Separate permission and command controls still apply; enabling autonomy does not repair another guard.",
+				message || (current
+					? `Autonomous policy guidance is on.\nTask: ${current.scope}\nEnds at task completion or ${new Date(current.expiresAt).toLocaleString()}.\nNext actor: agent. Continue the approved task. User stop command: /autonomous off`
+					: isPreparing ? "Preparing autonomous scope and access. Approval is not yet active.\nNext actor: agent. Continue the interview and safe access checks, then request approval with autonomous_mode action on. The user must choose Approve and start."
+						: "Autonomous policy guidance is off.\nNext actor: user, if a new task is wanted. /autonomous on starts preparation; it does not grant execution access."),
+			].join("\n") }],
 			details: { isActive: !!current, isPreparing, approval: current, message },
 		};
 	}
@@ -1166,9 +1178,11 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			if (!isCurrent()) return modeResult(ctx, "Autonomous approval request expired or was cancelled.");
 			pi.events.emit("herdr:blocked", { active: true, label: "Review autonomous scope" });
 			try {
-				if (!isPreparing || preparationAnswers === 0) return beginPreparation(ctx);
+				if (currentApproval(ctx)) return modeResult(ctx, "Approval is already active. Next actor: agent. Continue the approved task. A replacement scope requires the user to revoke it with /autonomous off first.");
+				if (!isPreparing) return beginPreparation(ctx);
+				if (preparationAnswers === 0) return modeResult(ctx, "Preparation is already active, but no completed human interview answer is recorded. Next actor: agent. Ask the next scope question with ask_user_question, then finish the access checks. Do not restart preparation.");
 				if (!isAutonomousScope(proposed) || Date.parse(proposed.expiresAt) <= Date.now()) {
-					return modeResult(ctx, "Complete the scope interview and access preparation. Supply a settled scope, preparation summary, readable principle sources, and a future expiry.");
+					return modeResult(ctx, "Start blocked: the proposed scope is incomplete, invalid, or expired. Next actor: agent. Supply the settled scope, preparation summary, readable principle sources, and a future expiry with autonomous_mode action on. Keep completed preparation.");
 				}
 				const reviewed: AutonomousScope = {
 					taskId: proposed.taskId, scope: proposed.scope, expiresAt: proposed.expiresAt,
@@ -1180,11 +1194,11 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 					},
 				};
 				if (reviewed.preparation.credentials.length) {
-					if (!ctx.tools.some(({ name }) => name === "cred_list")) return modeResult(ctx, "Credential checks unavailable. Complete access preparation before starting.");
+					if (!ctx.tools.some(({ name }) => name === "cred_list")) return modeResult(ctx, "Start blocked: cred_list is unavailable, so required credential grants cannot be checked. Next actor: agent. Report the missing credential integration. No recovery command has been verified; do not treat a credential as ready.");
 					const listing = await ctx.executeTool("cred_list", {}, { signal });
 					const catalog = listing.result.details as { credentials?: Array<{ name: string; isGranted: boolean }> } | undefined;
 					const missing = reviewed.preparation.credentials.filter((name) => !catalog?.credentials?.some((item) => item.name === name && item.isGranted === true));
-					if (listing.isError || missing.length) return modeResult(ctx, `Access preparation blocked. Required credentials are not verified as granted: ${missing.join(", ") || "credential listing failed"}. Use the existing credential grant flow with owner authentication, then retry.`);
+					if (listing.isError || missing.length) return modeResult(ctx, `Access preparation blocked. Required credentials are not verified as granted: ${missing.join(", ") || "credential listing failed"}. Next actor: agent. Inspect cred_list metadata, register missing credentials through cred_ask, and show any applicable /cred grant command in normal chat. The owner must approve grants through the existing credential controls. Recheck metadata before retrying autonomous_mode action on. No grant was made by this request.`);
 				}
 				try {
 					for (const source of reviewed.principleSources) {
@@ -1192,7 +1206,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 						if (!(await stat(source)).isFile()) throw new Error("Not a file");
 					}
 				} catch {
-					return modeResult(ctx, "Each principle source must be an existing readable owner file. Autonomous approval unchanged.");
+					return modeResult(ctx, "Start blocked: a principle source is missing, unreadable, or not a file. Autonomous approval unchanged. Next actor: agent. Inspect the proposed paths and retry autonomous_mode action on with existing readable owner files. No permission change has been made.");
 				}
 				if (!isCurrent()) return modeResult(ctx, "Autonomous approval request expired.");
 				refreshStatus(ctx, "Autonomous · Needs approval");

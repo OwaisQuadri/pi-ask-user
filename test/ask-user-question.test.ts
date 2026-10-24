@@ -882,6 +882,45 @@ async function approveMode(picker: Awaited<ReturnType<typeof loadPicker>>, scope
 	return pending;
 }
 
+test("repeated preparation retains human answers and distinguishes approval from execution access", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		const mode = picker.tools.get("autonomous_mode");
+		const off = await mode.execute("status", { action: "status" }, undefined, undefined, picker.ctx);
+		assert.match(off.content[0].text, /Phase: off\. Autonomous approval: not active/);
+		await prepareMode(picker);
+		for (const action of ["prepare", "status"]) {
+			const result = await mode.execute(action, { action }, undefined, undefined, picker.ctx);
+			assert.match(result.content[0].text, /Phase: preparation\. Autonomous approval: not active/);
+			assert.match(result.content[0].text, /enabling autonomy does not repair another guard/);
+			assert.equal(result.details.isPreparing, true);
+		}
+		await picker.commands.get("autonomous").handler("on", picker.ctx);
+		assert.match(picker.sentMessages.at(-1).message.content, /Preparation is already active/);
+		const pending = mode.execute("start", { action: "on", scope: autonomousScope() }, undefined, undefined, picker.ctx);
+		await waitForComponent(() => picker.selections[0]);
+		picker.resolveSelection("Approve and start");
+		const approved = await pending;
+		assert.equal(approved.details.isActive, true);
+		assert.match(approved.content[0].text, /Phase: active\. Autonomous approval: active/);
+		assert.match(approved.content[0].text, /Execution access: unchanged/);
+	} finally { await picker.dispose(); }
+});
+
+test("starting without interview answers reports the current phase without resetting preparation", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		const mode = picker.tools.get("autonomous_mode");
+		await mode.execute("prepare", { action: "prepare" }, undefined, undefined, picker.ctx);
+		const result = await mode.execute("start", { action: "on", scope: autonomousScope() }, undefined, undefined, picker.ctx);
+		assert.match(result.content[0].text, /Preparation is already active, but no completed human interview answer/);
+		assert.match(result.content[0].text, /Next actor: agent/);
+		assert.equal(result.details.isPreparing, true);
+		assert.equal(result.details.isActive, false);
+		assert.equal(picker.selections.length, 0);
+	} finally { await picker.dispose(); }
+});
+
 test("autonomous enablement and widening require human confirmation, not proposed approval text", async () => {
 	const picker = await loadPicker("tui");
 	try {
