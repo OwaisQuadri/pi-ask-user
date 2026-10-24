@@ -12,9 +12,11 @@ import {
 	type EditorTheme,
 	Key,
 	Text,
+	ScrollView,
 	matchesKey,
 	truncateToWidth,
 	wrapTextWithAnsi,
+	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 
@@ -171,6 +173,7 @@ interface AskUserQuestionRpcRequest {
 	requestId: string;
 	params: AskUserQuestionInput;
 	signal?: AbortSignal;
+	onPresented?: () => Promise<void>;
 }
 
 function isAbortSignal(value: unknown): value is AbortSignal {
@@ -283,6 +286,22 @@ function addWrapped(lines: string[], text: string, width: number, indent = ""): 
 	}
 }
 
+function addExactWrapped(lines: string[], text: string, width: number, indent = ""): void {
+	indent = indent.slice(0, Math.max(0, width - 2));
+	const contentWidth = Math.max(2, width - indent.length);
+	for (const line of text.split("\n")) {
+		let current = "";
+		let columns = 0;
+		for (const { segment } of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(line)) {
+			const size = visibleWidth(segment);
+			if (columns + size > contentWidth) { lines.push(indent + current); current = ""; columns = 0; }
+			current += segment;
+			columns += size;
+		}
+		lines.push(indent + current);
+	}
+}
+
 function formatAnswerForModel(answer: AskAnswer): string {
 	switch (answer.type) {
 		case "text":
@@ -390,12 +409,43 @@ function redactDeep<T>(value: T): T {
 	return value;
 }
 
+function isQuestionScrollKey(data: string): boolean {
+	return matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown)
+		|| matchesKey(data, Key.ctrl("u")) || matchesKey(data, Key.ctrl("d"));
+}
+
+function createQuestionViewport(tui: { terminal: { rows: number }; requestRender(): void }) {
+	let content: string[] = [];
+	let pageSize = 1;
+	const body = new ScrollView({ render: () => content, invalidate() {} }, { scrollbar: "hidden" });
+	return {
+		render(lines: string[], contentLength: number, width: number): string[] {
+			content = lines.slice(0, contentLength);
+			const controls = lines.slice(contentLength);
+			const height = tui.terminal.rows - 13 - controls.length - 1;
+			if (height < 1) return [];
+			pageSize = Math.min(5, height);
+			body.updateLayout(content.length, height, () => tui.requestRender());
+			const hint: string[] = [];
+			addExactWrapped(hint, "Ctrl+U/D review", width);
+			return [...content.slice(body.scrollTop, body.scrollTop + height), ...controls, ...hint];
+		},
+		isScrollInputConsumed(data: string): boolean {
+			if (!isQuestionScrollKey(data)) return false;
+			body.scrollBy(matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("u")) ? -pageSize : pageSize);
+			tui.requestRender();
+			return true;
+		},
+	};
+}
+
 async function askFreeText(
 	ctx: ExtensionContext,
 	question: string,
 	context: string | undefined,
 	signal: AbortSignal | undefined,
 	isSecure = false,
+	isExact = false,
 ): Promise<string | undefined> {
 	if (ctx.mode === "rpc") {
 		const title = context ? `${question}\n\n${context}` : question;
@@ -414,6 +464,7 @@ async function askFreeText(
 		signal?.addEventListener("abort", onAbort, { once: true });
 		if (signal?.aborted) onAbort();
 
+		const viewport = isExact ? createQuestionViewport(tui) : undefined;
 		let cachedLines: string[] | undefined;
 		let cachedWidth = -1;
 		let isMasked = false;
@@ -426,17 +477,20 @@ async function askFreeText(
 		}
 
 		function render(width: number): string[] {
-			if (cachedLines && cachedWidth === width) return cachedLines;
+			if (!isExact && cachedLines && cachedWidth === width) return cachedLines;
 
 			const lines: string[] = [];
 			const add = (text: string) => lines.push(truncateToWidth(text, width));
 			add(theme.fg("accent", "─".repeat(width)));
-			addWrapped(lines, theme.fg("text", ` ${question}`), width);
+			if (isExact) addExactWrapped(lines, ` ${question}`, width);
+			else addWrapped(lines, theme.fg("text", ` ${question}`), width);
 			if (context) {
 				lines.push("");
-				addWrapped(lines, theme.fg("muted", ` ${context}`), width);
+				if (isExact) addExactWrapped(lines, ` ${context}`, width);
+				else addWrapped(lines, theme.fg("muted", ` ${context}`), width);
 			}
 			lines.push("");
+			const contentLength = lines.length;
 			if (isSecure && isMasked) add(` ${theme.fg("text", "•".repeat(editor.getText().length))}`);
 			else for (const line of editor.render(Math.max(1, width - 2))) add(` ${line}`);
 			lines.push("");
@@ -444,9 +498,9 @@ async function askFreeText(
 				? ` Secret: the agent gets a handle, not the value • Ctrl+T ${isMasked ? "show" : "hide"} • Enter submit • Esc cancel`
 				: " Shift+Enter newline • Enter submit • Esc cancel"));
 			add(theme.fg("accent", "─".repeat(width)));
-			cachedLines = lines;
+			cachedLines = viewport ? viewport.render(lines, contentLength, width) : lines;
 			cachedWidth = width;
-			return lines;
+			return cachedLines;
 		}
 
 		return {
@@ -455,6 +509,7 @@ async function askFreeText(
 				cachedLines = undefined;
 			},
 			handleInput(data: string) {
+				if (viewport?.isScrollInputConsumed(data)) return;
 				if (matchesKey(data, Key.escape)) {
 					finish(undefined);
 					return;
@@ -484,6 +539,7 @@ async function askSingleChoice(
 	context: string | undefined,
 	options: AskOption[],
 	signal: AbortSignal | undefined,
+	isExact = false,
 ): Promise<AskAnswer | null> {
 	const allOptions = buildChoiceItems(options);
 
@@ -500,6 +556,7 @@ async function askSingleChoice(
 		if (signal?.aborted) onAbort();
 		let optionIndex = 0;
 		let editMode = false;
+		const viewport = isExact ? createQuestionViewport(tui) : undefined;
 		let cachedLines: string[] | undefined;
 		let cachedWidth = -1;
 		const editor = new Editor(tui, createEditorTheme(theme));
@@ -516,6 +573,7 @@ async function askSingleChoice(
 		}
 
 		function handleInput(data: string) {
+			if (viewport?.isScrollInputConsumed(data)) return;
 			if (editMode) {
 				if (matchesKey(data, Key.escape)) {
 					editMode = false;
@@ -568,18 +626,22 @@ async function askSingleChoice(
 			// invalidate() on terminal resize, so render() can be re-entered with a
 			// new width. Returning stale wider lines trips the TUI width guard and
 			// crashes the process.
-			if (cachedLines && cachedWidth === width) return cachedLines;
+			if (!isExact && cachedLines && cachedWidth === width) return cachedLines;
 
 			const lines: string[] = [];
 			const add = (text: string) => lines.push(truncateToWidth(text, width));
 
 			add(theme.fg("accent", "─".repeat(width)));
-			addWrapped(lines, theme.fg("text", ` ${question}`), width);
+			if (isExact) addExactWrapped(lines, ` ${question}`, width);
+			else addWrapped(lines, theme.fg("text", ` ${question}`), width);
 			if (context) {
 				lines.push("");
-				addWrapped(lines, theme.fg("muted", ` ${context}`), width);
+				if (isExact) addExactWrapped(lines, ` ${context}`, width);
+				else addWrapped(lines, theme.fg("muted", ` ${context}`), width);
 			}
 			lines.push("");
+
+			const contentLength = lines.length;
 
 			for (let i = 0; i < allOptions.length; i++) {
 				const option = allOptions[i];
@@ -587,9 +649,11 @@ async function askSingleChoice(
 				const prefix = selected ? theme.fg("accent", "> ") : "  ";
 				const label = option.isOther ? option.label : `${option.index}. ${option.label}`;
 				const styled = selected ? theme.fg("accent", label) : theme.fg("text", label);
-				add(`${prefix}${styled}`);
+				if (isExact) addExactWrapped(lines, `${i === optionIndex ? "> " : "  "}${label}`, width);
+				else add(`${prefix}${styled}`);
 				if (option.description) {
-					addWrapped(lines, theme.fg("muted", option.description), width, "     ");
+					if (isExact) addExactWrapped(lines, option.description, width, "     ");
+					else addWrapped(lines, theme.fg("muted", option.description), width, "     ");
 				}
 			}
 
@@ -607,9 +671,9 @@ async function askSingleChoice(
 			}
 
 			add(theme.fg("accent", "─".repeat(width)));
-			cachedLines = lines;
+			cachedLines = viewport ? viewport.render(lines, contentLength, width) : lines;
 			cachedWidth = width;
-			return lines;
+			return cachedLines;
 		}
 
 		return {
@@ -631,6 +695,7 @@ async function askMultiChoice(
 	context: string | undefined,
 	options: AskOption[],
 	signal: AbortSignal | undefined,
+	isExact = false,
 ): Promise<AskAnswer[] | null> {
 	return ctx.ui.custom<AskAnswer[] | null>((tui: any, theme: any, _kb: any, done: (result: AskAnswer[] | null) => void) => {
 		let isDone = false;
@@ -646,6 +711,7 @@ async function askMultiChoice(
 		let optionIndex = 0;
 		let editMode = false;
 		let editingOtherIndex: number | undefined;
+		const viewport = isExact ? createQuestionViewport(tui) : undefined;
 		let cachedLines: string[] | undefined;
 		let cachedWidth = -1;
 		const selected = new Map<string, OptionAnswer>();
@@ -706,6 +772,7 @@ async function askMultiChoice(
 		}
 
 		function handleInput(data: string) {
+			if (viewport?.isScrollInputConsumed(data)) return;
 			if (editMode) {
 				if (matchesKey(data, Key.escape)) {
 					editMode = false;
@@ -779,18 +846,22 @@ async function askMultiChoice(
 			// invalidate() on terminal resize, so render() can be re-entered with a
 			// new width. Returning stale wider lines trips the TUI width guard and
 			// crashes the process.
-			if (cachedLines && cachedWidth === width) return cachedLines;
+			if (!isExact && cachedLines && cachedWidth === width) return cachedLines;
 
 			const lines: string[] = [];
 			const add = (text: string) => lines.push(truncateToWidth(text, width));
 
 			add(theme.fg("accent", "─".repeat(width)));
-			addWrapped(lines, theme.fg("text", ` ${question}`), width);
+			if (isExact) addExactWrapped(lines, ` ${question}`, width);
+			else addWrapped(lines, theme.fg("text", ` ${question}`), width);
 			if (context) {
 				lines.push("");
-				addWrapped(lines, theme.fg("muted", ` ${context}`), width);
+				if (isExact) addExactWrapped(lines, ` ${context}`, width);
+				else addWrapped(lines, theme.fg("muted", ` ${context}`), width);
 			}
 			lines.push("");
+
+			const contentLength = lines.length;
 
 			const allItems = getItems();
 			for (let i = 0; i < allItems.length; i++) {
@@ -828,9 +899,11 @@ async function askMultiChoice(
 				const styled = isFocused
 					? theme.fg("accent", label)
 					: theme.fg(checked ? "success" : "text", label);
-				add(`${prefix}${styled}`);
+				if (isExact) addExactWrapped(lines, `${i === optionIndex ? "> " : "  "}${label}`, width);
+				else add(`${prefix}${styled}`);
 				if (item.description) {
-					addWrapped(lines, theme.fg("muted", item.description), width, "     ");
+					if (isExact) addExactWrapped(lines, item.description, width, "     ");
+					else addWrapped(lines, theme.fg("muted", item.description), width, "     ");
 				}
 			}
 
@@ -851,9 +924,9 @@ async function askMultiChoice(
 			}
 
 			add(theme.fg("accent", "─".repeat(width)));
-			cachedLines = lines;
+			cachedLines = viewport ? viewport.render(lines, contentLength, width) : lines;
 			cachedWidth = width;
-			return lines;
+			return cachedLines;
 		}
 
 		return {
@@ -896,6 +969,67 @@ function withUILock<T>(fn: () => Promise<T>): Promise<T> {
 	return sharedUiLock.withLock(fn);
 }
 
+function presentationContext(
+	ctx: ExtensionContext,
+	signal: AbortSignal,
+	onPresented: () => Promise<void>,
+	isCurrent: () => boolean,
+): ExtensionContext {
+	return {
+		...ctx,
+		ui: {
+			...ctx.ui,
+			custom: <T>(factory: any, options?: any) => ctx.ui.custom<T>((tui, theme, keys, done) => {
+				let isDone = false;
+				let isReady = false;
+				let isScheduled = false;
+				let component: any;
+				const finish = (value: T) => {
+					if (isDone) return;
+					isDone = true;
+					signal.removeEventListener("abort", cancel);
+					component?.dispose?.();
+					done(value);
+				};
+				const cancel = () => finish(undefined as T);
+				component = factory(tui, theme, keys, (value: T) => {
+					if (value === null || value === undefined) cancel();
+					else if (isReady && !signal.aborted && isCurrent()) finish(value);
+					else if (signal.aborted || !isCurrent()) cancel();
+				});
+				signal.addEventListener("abort", cancel, { once: true });
+				if (signal.aborted) cancel();
+				return {
+					render(width: number) {
+						if (width < 2) { cancel(); return []; }
+						const lines = component.render(width);
+						if (lines.length === 0) { cancel(); return []; }
+						if (!isScheduled && !isDone) {
+							isScheduled = true;
+							void Promise.resolve().then(async () => {
+								if (isDone || signal.aborted || !isCurrent()) { cancel(); return; }
+								const acknowledgment = onPresented();
+								if (!acknowledgment || typeof acknowledgment.then !== "function") throw new Error("Invalid presentation acknowledgment");
+								await acknowledgment;
+								if (isDone || signal.aborted || !isCurrent()) { cancel(); return; }
+								isReady = true;
+							}).catch(cancel);
+						}
+						return lines;
+					},
+					handleInput(data: string) {
+						if (isDone) return;
+						if (signal.aborted || !isCurrent() || matchesKey(data, Key.escape)) { cancel(); return; }
+						if (isReady || isQuestionScrollKey(data)) component.handleInput?.(data);
+					},
+					invalidate() { component.invalidate?.(); },
+					dispose() { cancel(); component.dispose?.(); },
+				};
+			}, options),
+		},
+	};
+}
+
 async function executeQuestion(
 	pi: ExtensionAPI,
 	params: AskUserQuestionInput,
@@ -903,9 +1037,13 @@ async function executeQuestion(
 	ctx: ExtensionContext,
 	isContextActive?: () => boolean,
 	getGuidance?: () => { text: string; approvalId?: string; isError?: boolean } | undefined,
+	onPresented?: () => Promise<void>,
 ) {
-	const options = normalizeOptions(params.options);
-	const context = params.details?.trim() || undefined;
+	const options = onPresented
+		? (params.options ?? []).map((option) => ({ ...option, value: option.value ?? option.label }))
+		: normalizeOptions(params.options);
+	const context = onPresented ? params.details : params.details?.trim() || undefined;
+	if (onPresented) ctx = presentationContext(ctx, signal!, onPresented, isContextActive!);
 	const mode: AskUserQuestionMode = options.length === 0 ? "text" : params.multiSelect ? "multi-select" : "single-select";
 
 	if (params.secure && options.length > 0) {
@@ -950,7 +1088,8 @@ async function executeQuestion(
 		pi.events.emit("herdr:blocked", { active: true, label: params.question });
 		try {
 			if (mode === "text" && params.secure) {
-				const answer = (await askFreeText(ctx, params.question, context, signal, true))?.trim();
+				const answer = (await askFreeText(ctx, params.question, context, signal, true, !!onPresented))?.trim();
+				if (onPresented && (signal?.aborted || !isContextActive?.())) return cancelledResult(params.question, mode, context);
 				if (!answer) return cancelledResult(params.question, mode, context);
 				const handle = `{{secret:${randomBytes(4).toString("hex")}}}`;
 				secrets.set(handle, answer);
@@ -958,7 +1097,8 @@ async function executeQuestion(
 				return secretResult(params.question, context, handle);
 			}
 			if (mode === "text") {
-				const answer = await askFreeText(ctx, params.question, context, signal);
+				const answer = await askFreeText(ctx, params.question, context, signal, false, !!onPresented);
+				if (onPresented && (signal?.aborted || !isContextActive?.())) return cancelledResult(params.question, mode, context);
 				if (answer === undefined) return cancelledResult(params.question, mode, context);
 				return buildResult(params.question, context, mode, [
 					{ type: "text", label: answer.trim(), value: answer.trim() },
@@ -966,12 +1106,14 @@ async function executeQuestion(
 			}
 
 			if (mode === "single-select") {
-				const answer = await askSingleChoice(ctx, params.question, context, options, signal);
+				const answer = await askSingleChoice(ctx, params.question, context, options, signal, !!onPresented);
+				if (onPresented && (signal?.aborted || !isContextActive?.())) return cancelledResult(params.question, mode, context);
 				if (!answer) return cancelledResult(params.question, mode, context);
 				return buildResult(params.question, context, mode, [answer]);
 			}
 
-			const answers = await askMultiChoice(ctx, params.question, context, options, signal);
+			const answers = await askMultiChoice(ctx, params.question, context, options, signal, !!onPresented);
+			if (onPresented && (signal?.aborted || !isContextActive?.())) return cancelledResult(params.question, mode, context);
 			if (!answers) return cancelledResult(params.question, mode, context);
 			return buildResult(params.question, context, mode, answers);
 		} finally {
@@ -986,6 +1128,13 @@ async function executeQuestion(
 
 export default function askUserQuestion(pi: ExtensionAPI) {
 	let activeContext: ExtensionContext | undefined;
+	const presentations = new Map<string, AbortController>();
+	let presentationRevision = 0;
+	const invalidatePresentations = () => {
+		presentationRevision++;
+		for (const controller of presentations.values()) controller.abort();
+		presentations.clear();
+	};
 	let isRpcOwner = false;
 	let owningSessionId: string | undefined;
 	let approval: AutonomousApproval | undefined;
@@ -1020,15 +1169,17 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		return isOwningSession(ctx) && !isPreparing ? approval : undefined;
 	}
 	pi.on("session_start", (_event, ctx) => {
+		invalidatePresentations();
 		expireApproval();
 		activeContext = ctx.mode === "tui" ? ctx : undefined;
 		owningSessionId = activeContext?.sessionManager.getSessionId();
 		isRpcOwner = ctx.mode === "tui";
 	});
-	pi.on("session_before_switch", expireApproval);
-	pi.on("session_before_fork", expireApproval);
-	pi.on("session_before_tree", expireApproval);
+	pi.on("session_before_switch", () => { invalidatePresentations(); expireApproval(); });
+	pi.on("session_before_fork", () => { invalidatePresentations(); expireApproval(); });
+	pi.on("session_before_tree", () => { invalidatePresentations(); expireApproval(); });
 	pi.on("session_shutdown", () => {
+		invalidatePresentations();
 		expireApproval();
 		activeContext = undefined;
 	});
@@ -1334,25 +1485,45 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		const request = payload as AskUserQuestionRpcRequest;
 		if (typeof request.requestId !== "string" || request.requestId.length === 0) return;
 		const replyChannel = `${RPC_ASK_CHANNEL}:reply:${request.requestId}`;
+		let controller: AbortController | undefined;
+		const onAbort = () => controller?.abort();
 		try {
 			if (!activeContext) throw new Error("No active interactive session");
 			if (!isAskUserQuestionInput(request.params)) throw new Error("Invalid ask_user_question parameters");
 			if (request.signal !== undefined && !isAbortSignal(request.signal)) throw new Error("Invalid ask_user_question abort signal");
+			if ("onPresented" in request && typeof request.onPresented !== "function") throw new Error("Invalid ask_user_question presentation callback");
 			const context = activeContext;
-			const data = await executeQuestion(pi, request.params, request.signal, context, () => activeContext === context, () => {
-				if (!currentApproval(context) || request.params.secure
-					|| request.params.policy?.kind === "approval" || request.params.policy?.kind === "information") return undefined;
+			const revision = presentationRevision;
+			const sessionId = context.sessionManager.getSessionId();
+			const onPresented = request.onPresented;
+			const params: AskUserQuestionInput = onPresented ? structuredClone(request.params) : request.params;
+			if (onPresented && [params.question, params.details ?? "", ...(params.options ?? []).flatMap((option) => [option.label, option.description ?? ""])].some((text) => /[\x00-\x09\x0b-\x1f\x7f-\x9f]/u.test(text))) throw new Error("Question presentation requires plain text");
+			if (onPresented) {
+				controller = new AbortController();
+				presentations.get(request.requestId)?.abort();
+				presentations.set(request.requestId, controller);
+				request.signal?.addEventListener("abort", onAbort, { once: true });
+				if (request.signal?.aborted) controller.abort();
+			}
+			const isCurrent = () => activeContext === context && (!onPresented
+				|| (presentationRevision === revision && context.sessionManager.getSessionId() === sessionId && !controller?.signal.aborted));
+			const data = await executeQuestion(pi, params, controller?.signal ?? request.signal, context, isCurrent, () => {
+				if (!currentApproval(context) || params.secure
+					|| params.policy?.kind === "approval" || params.policy?.kind === "information") return undefined;
 				return {
 					text: "AI AUTO-REPLY (artificial intelligence). AI ROUTING ERROR: No human was asked. Send this decision to your supervising agent through its existing supervisor channel. You receive no autonomous approval or execution authority. The supervisor must resolve routine work or request human approval for a new boundary.",
 					isError: true,
 				};
-			});
+			}, onPresented);
 			pi.events.emit(replyChannel, { success: true, data });
 		} catch (error) {
 			pi.events.emit(replyChannel, {
 				success: false,
-				error: error instanceof Error ? error.message : String(error),
+				error: request.onPresented ? "Question presentation failed" : error instanceof Error ? error.message : String(error),
 			});
+		} finally {
+			if (isAbortSignal(request.signal)) request.signal.removeEventListener("abort", onAbort);
+			if (controller && presentations.get(request.requestId) === controller) presentations.delete(request.requestId);
 		}
 	});
 

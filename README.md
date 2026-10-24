@@ -139,6 +139,35 @@ Even an exact protected-action match only provides guidance about an existing bo
 It never approves execution or bypasses another control.
 Model-supplied text cannot create an approval.
 
+## Trusted runtime presentation acknowledgment
+
+An in-process caller can emit `ask-user-question:rpc:ask` with
+`{ requestId: string, params: AskUserQuestionInput, signal?: AbortSignal, onPresented?: () => Promise<void> }`.
+The callback is not a tool parameter and cannot travel over JSON RPC. Replies retain
+`ask-user-question:rpc:ask:reply:${requestId}` and the existing result shape.
+
+When supplied, the callback runs once in a microtask after the first question render
+returns and the immutable content and controls are installed. All answer input,
+including rejection and deferral, waits for successful acknowledgment. Early input
+is discarded, not replayed. Escape cancels while acknowledgment is pending.
+Callback rejection, invalid callback returns, abort, disposal, session changes, and
+shutdown fail closed without interactive-user success. Invalid supplied callbacks
+are rejected; omit the property to retain ordinary question behavior.
+
+The hooked surface preserves question details, option labels and values without
+trimming. Plain content is hard-wrapped without dropping whitespace. Terminal
+control characters other than newlines are rejected rather than interpreted.
+Long details scroll with Page Up/Down or Ctrl+U/D in the same question surface;
+actions remain visible. A terminal too small to fit the actions cancels rather
+than silently clipping them. Resizing and scrolling do not change the proposal.
+
+This is a trusted same-process integration, not a malicious-extension sandbox.
+The caller owns the exact content digest, request identity, callback invalidation,
+and durable approval validation. Rendering acknowledgment is not proof that the
+human read every line, nor proof of a physical terminal flush. The host still owns
+actual visual and interactive verification. Existing AI guidance remains AI guidance
+and never gains human provenance from the callback.
+
 ## Test
 
 ```sh
