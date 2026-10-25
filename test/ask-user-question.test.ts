@@ -1516,3 +1516,51 @@ test("presentation scroll and resize keep exact long details accessible while ac
 		assert.equal(replies[0].data.details.status, "answered");
 	} finally { await picker.dispose(); }
 });
+
+test("native management can acknowledge and select its single explicit option", { timeout: 5_000 }, async () => {
+	for (const option of [{ label: "Approve", value: "approve" }, { label: "Detach only", value: "detach" }]) {
+		const picker = await loadPicker("tui", false, 80);
+		try {
+			let acknowledge!: () => void;
+			let calls = 0;
+			const replies = presentationRequest(picker, {
+				params: { question: "Apply this exact approved-memory change?", details: "Exact management preview", options: [option] },
+				onPresented: () => { calls++; return new Promise<void>((resolve) => { acknowledge = resolve; }); },
+			});
+			const component = await waitForComponent(picker.component);
+			component.render(80);
+			await flushPresentation();
+			component.handleInput("ENTER");
+			assert.equal(calls, 1);
+			assert.equal(replies.length, 0);
+			acknowledge();
+			await flushPresentation();
+			component.handleInput("ENTER");
+			await flushPresentation();
+			assert.equal(replies[0].data.details.status, "answered");
+			assert.equal(replies[0].data.details.provenance, "interactive-user");
+			assert.equal(replies[0].data.details.answers[0].value, option.value);
+		} finally { await picker.dispose(); }
+	}
+});
+
+test("native tab previews render bounded tab symbols and retain exact returned context", { timeout: 5_000 }, async () => {
+	const picker = await loadPicker("tui", false, 80);
+	try {
+		const details = "\tIndented\tclaim\n\tEvidence";
+		const replies = presentationRequest(picker, {
+			params: { question: "Review?", details, options: [{ label: "Approve" }, { label: "Reject" }] },
+			onPresented: async () => {},
+		});
+		const component = await waitForComponent(picker.component);
+		const lines = component.render(40);
+		assert.match(lines.join("\n"), /␉Indented␉claim/);
+		assert.match(lines.join("\n"), /␉Evidence/);
+		assert.ok(lines.every((line) => !line.includes("\t") && line.length <= 40));
+		await flushPresentation();
+		component.handleInput("ENTER");
+		await flushPresentation();
+		assert.equal(replies[0].data.details.status, "answered");
+		assert.equal(replies[0].data.details.context, details);
+	} finally { await picker.dispose(); }
+});

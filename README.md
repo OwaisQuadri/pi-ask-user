@@ -155,8 +155,10 @@ shutdown fail closed without interactive-user success. Invalid supplied callback
 are rejected; omit the property to retain ordinary question behavior.
 
 The hooked surface preserves question details, option labels and values without
-trimming. Plain content is hard-wrapped without dropping whitespace. Terminal
-control characters other than newlines are rejected rather than interpreted.
+trimming. It permits a single explicit management option; ordinary questions still
+require at least two supplied options. Plain content is hard-wrapped without
+dropping whitespace. Tabs display as `␉`; returned context keeps the original tabs.
+Other terminal control characters except newlines are rejected rather than interpreted.
 Long details scroll with Page Up/Down or Ctrl+U/D in the same question surface;
 actions remain visible. A terminal too small to fit the actions cancels rather
 than silently clipping them. Resizing and scrolling do not change the proposal.

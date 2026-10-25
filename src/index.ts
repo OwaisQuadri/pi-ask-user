@@ -194,10 +194,6 @@ function normalizeOptions(options: Array<{ label: string; value?: string; descri
 		.filter((option) => option.label.length > 0);
 }
 
-function hasMinimumChoiceCount(options: AskOption[]): boolean {
-	return options.length >= 2;
-}
-
 function getOtherLabel(options: AskOption[]): string {
 	return options.some((option) => option.label.toLowerCase() === "other") ? "Other (custom)" : "Other";
 }
@@ -293,9 +289,10 @@ function addExactWrapped(lines: string[], text: string, width: number, indent = 
 		let current = "";
 		let columns = 0;
 		for (const { segment } of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(line)) {
-			const size = visibleWidth(segment);
+			const displayed = segment === "\t" ? "␉" : segment;
+			const size = visibleWidth(displayed);
 			if (columns + size > contentWidth) { lines.push(indent + current); current = ""; columns = 0; }
-			current += segment;
+			current += displayed;
 			columns += size;
 		}
 		lines.push(indent + current);
@@ -1052,7 +1049,7 @@ async function executeQuestion(
 	if (params.question.trim().length === 0) {
 		return invalidResult(params.question, mode, "ask_user_question requires a non-blank question", context);
 	}
-	if (params.options !== undefined && params.options.length > 0 && !hasMinimumChoiceCount(options)) {
+	if (!onPresented && params.options !== undefined && params.options.length > 0 && options.length < 2) {
 		return invalidResult(
 			params.question,
 			mode,
@@ -1497,7 +1494,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			const sessionId = context.sessionManager.getSessionId();
 			const onPresented = request.onPresented;
 			const params: AskUserQuestionInput = onPresented ? structuredClone(request.params) : request.params;
-			if (onPresented && [params.question, params.details ?? "", ...(params.options ?? []).flatMap((option) => [option.label, option.description ?? ""])].some((text) => /[\x00-\x09\x0b-\x1f\x7f-\x9f]/u.test(text))) throw new Error("Question presentation requires plain text");
+			if (onPresented && [params.question, params.details ?? "", ...(params.options ?? []).flatMap((option) => [option.label, option.description ?? ""])].some((text) => /[\x00-\x08\x0b-\x1f\x7f-\x9f]/u.test(text))) throw new Error("Question presentation requires plain text");
 			if (onPresented) {
 				controller = new AbortController();
 				presentations.get(request.requestId)?.abort();
