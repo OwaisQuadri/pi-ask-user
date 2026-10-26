@@ -12,6 +12,7 @@ export const Key = { up: "UP", down: "DOWN", enter: "ENTER", space: "SPACE", bac
 export const getNativeClipboard = () => globalThis.__askClipboard;
 export const matchesKey = (data, key) => data === key;
 export const truncateToWidth = (text) => text;
+export const visibleWidth = (text) => text.length;
 export const wrapTextWithAnsi = (text) => [text];
 export class Text { constructor(text) { this.text = text; } render() { return this.text.split("\\n"); } invalidate() {} }
 export class ScrollView {
@@ -66,7 +67,7 @@ async function writeModule(root: string, name: string, source: string): Promise<
 	await writeFile(join(directory, "index.js"), source);
 }
 
-async function loadPicker(mode = "rpc") {
+async function loadPicker(mode = "rpc", isAutoRendered = true, rows = 24) {
 	const root = await mkdtemp(join(tmpdir(), "ask-user-question-"));
 	await writeFile(join(root, "ask-user-question.ts"), await readFile(extensionPath));
 	await writeFile(join(root, "autonomous.ts"), await readFile(new URL("../src/autonomous.ts", import.meta.url)));
@@ -94,6 +95,7 @@ async function loadPicker(mode = "rpc") {
 	const sentMessages: any[] = [];
 	const credentialCatalog = { credentials: [] as Array<{ name: string; isGranted: boolean }> };
 	const branch: any[] = [];
+	const terminal = { rows };
 	const theme = {
 		fg(_name: string, text: string) {
 			return text;
@@ -128,8 +130,8 @@ async function loadPicker(mode = "rpc") {
 			custom(factory: any) {
 				customCallCount++;
 				return new Promise((resolve) => {
-					component = factory({ requestRender() {}, terminal: { rows: 24 } }, theme, {}, resolve);
-					if (component.render(80)[0] === "Approve autonomous work") {
+					component = factory({ requestRender() {}, terminal }, theme, {}, resolve);
+					if (isAutoRendered && component.render(80)[0] === "Approve autonomous work") {
 						const pages: string[] = [];
 						for (let page = 0; page < 8; page++) {
 							const lines = component.render(80);
@@ -194,6 +196,7 @@ async function loadPicker(mode = "rpc") {
 		resolveSelection: (choice: string | undefined) => resolveSelection?.(choice),
 		resolveConfirm: (isApproved: boolean) => resolveConfirm?.(isApproved),
 		ctx,
+		terminal,
 		api,
 		emitted,
 		lifecycleHandlers,
@@ -882,6 +885,45 @@ async function approveMode(picker: Awaited<ReturnType<typeof loadPicker>>, scope
 	return pending;
 }
 
+test("repeated preparation retains human answers and distinguishes approval from execution access", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		const mode = picker.tools.get("autonomous_mode");
+		const off = await mode.execute("status", { action: "status" }, undefined, undefined, picker.ctx);
+		assert.match(off.content[0].text, /Phase: off\. Autonomous approval: not active/);
+		await prepareMode(picker);
+		for (const action of ["prepare", "status"]) {
+			const result = await mode.execute(action, { action }, undefined, undefined, picker.ctx);
+			assert.match(result.content[0].text, /Phase: preparation\. Autonomous approval: not active/);
+			assert.match(result.content[0].text, /enabling autonomy does not repair another guard/);
+			assert.equal(result.details.isPreparing, true);
+		}
+		await picker.commands.get("autonomous").handler("on", picker.ctx);
+		assert.match(picker.sentMessages.at(-1).message.content, /Preparation is already active/);
+		const pending = mode.execute("start", { action: "on", scope: autonomousScope() }, undefined, undefined, picker.ctx);
+		await waitForComponent(() => picker.selections[0]);
+		picker.resolveSelection("Approve and start");
+		const approved = await pending;
+		assert.equal(approved.details.isActive, true);
+		assert.match(approved.content[0].text, /Phase: active\. Autonomous approval: active/);
+		assert.match(approved.content[0].text, /Execution access: unchanged/);
+	} finally { await picker.dispose(); }
+});
+
+test("starting without interview answers reports the current phase without resetting preparation", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		const mode = picker.tools.get("autonomous_mode");
+		await mode.execute("prepare", { action: "prepare" }, undefined, undefined, picker.ctx);
+		const result = await mode.execute("start", { action: "on", scope: autonomousScope() }, undefined, undefined, picker.ctx);
+		assert.match(result.content[0].text, /Preparation is already active, but no completed human interview answer/);
+		assert.match(result.content[0].text, /Next actor: agent/);
+		assert.equal(result.details.isPreparing, true);
+		assert.equal(result.details.isActive, false);
+		assert.equal(picker.selections.length, 0);
+	} finally { await picker.dispose(); }
+});
+
 test("autonomous enablement and widening require human confirmation, not proposed approval text", async () => {
 	const picker = await loadPicker("tui");
 	try {
@@ -1043,7 +1085,7 @@ test("autonomous command approval refuses expired scopes and unreadable sources 
 		await command.handler("status", picker.ctx);
 		assert.match(picker.notices.at(-1)!, /Autonomous policy guidance is on/);
 		await command.handler("off", picker.ctx);
-		assert.equal(picker.notices.at(-1), "Autonomous policy guidance is off.");
+		assert.match(picker.notices.at(-1)!, /Autonomous policy guidance is off\./);
 	} finally { await picker.dispose(); }
 });
 
@@ -1278,4 +1320,247 @@ test("native reminder ownership and later-hook exhaustion cannot be restarted by
 			assert.equal((await modeStatus(picker)).details.isActive, true);
 		} finally { await picker.dispose(); }
 	}
+});
+
+function presentationRequest(picker: Awaited<ReturnType<typeof loadPicker>>, payload: Record<string, unknown>) {
+	const replies: any[] = [];
+	const requestId = "presentation";
+	picker.api.events.on(`ask-user-question:rpc:ask:reply:${requestId}`, (reply) => replies.push(reply));
+	picker.api.events.emit("ask-user-question:rpc:ask", { requestId, ...payload });
+	return replies;
+}
+
+async function flushPresentation() {
+	await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+test("presentation acknowledgment follows render once and blocks approve, reject and defer until resolved", { timeout: 5_000 }, async () => {
+	for (const choice of [0, 1, 2]) {
+		const picker = await loadPicker("tui", false, 80);
+		try {
+			let acknowledge!: () => void;
+			let calls = 0;
+			let rendered = "";
+			const params = {
+				question: "Review?",
+				details: "  exact proposal\n\nreason and evidence  ",
+				options: [{ label: " Approve ", value: " approve " }, { label: "Reject" }, { label: "Defer" }],
+			};
+			const replies = presentationRequest(picker, {
+				params,
+				onPresented: () => {
+					calls++;
+					assert.ok(rendered.includes(params.details));
+					assert.match(rendered, /1\.  Approve /);
+					assert.match(rendered, /Enter select/);
+					return new Promise<void>((resolve) => { acknowledge = resolve; });
+				},
+			});
+			const component = await waitForComponent(picker.component);
+			assert.equal(calls, 0);
+			component.handleInput("ENTER");
+			rendered = component.render(80).join("\n");
+			await flushPresentation();
+			assert.equal(calls, 1);
+			component.render(40);
+			for (const key of ["DOWN", "1", "2", "3", "a", "r", "d", "SPACE", "ENTER", "\u001b[<0;1;1M"]) component.handleInput(key);
+			await flushPresentation();
+			assert.equal(replies.length, 0);
+			acknowledge();
+			await flushPresentation();
+			for (let index = 0; index < choice; index++) component.handleInput("DOWN");
+			component.handleInput("ENTER");
+			await flushPresentation();
+			assert.equal(calls, 1);
+			assert.equal(replies.length, 1);
+			assert.equal(replies[0].data.details.status, "answered");
+			assert.equal(replies[0].data.details.provenance, "interactive-user");
+			assert.equal(replies[0].data.details.context, params.details);
+			assert.equal(replies[0].data.details.answers[0].value, params.options[choice].value ?? params.options[choice].label);
+			component.handleInput("ENTER");
+			await flushPresentation();
+			assert.equal(replies.length, 1);
+		} finally { await picker.dispose(); }
+	}
+});
+
+test("presentation cancellation, failure, abort and session invalidation cannot revive late choices", { timeout: 5_000 }, async () => {
+	for (const ending of ["escape", "failure", "throw", "invalid-return", "abort", "dispose", "session_start", "session_before_switch", "session_before_fork", "session_before_tree", "session_shutdown", "session-id"]) {
+		const picker = await loadPicker("tui", true, 80);
+		const signal = createTrackedAbortSignal();
+		try {
+			let acknowledge!: () => void;
+			let reject!: (reason: unknown) => void;
+			const replies = presentationRequest(picker, {
+				params: { question: "Review?", details: "exact", options: [{ label: "Approve" }, { label: "Reject" }] },
+				signal: signal.signal,
+				onPresented: () => {
+					if (ending === "throw") throw new Error("private callback failure");
+					if (ending === "invalid-return") return undefined;
+					return new Promise<void>((resolve, fail) => { acknowledge = resolve; reject = fail; });
+				},
+			});
+			const component = await waitForComponent(picker.component);
+			await flushPresentation();
+			if (ending === "escape") component.handleInput("ESC");
+			else if (ending === "failure") reject(new Error("private callback failure"));
+			else if (ending === "abort") signal.abort();
+			else if (ending === "dispose") component.dispose();
+			else if (ending === "session-id") picker.ctx.sessionManager.getSessionId = () => "changed";
+			else if (ending.startsWith("session_")) picker.lifecycleHandlers.get(ending)?.({}, picker.ctx);
+			if (ending !== "failure") acknowledge?.();
+			await flushPresentation();
+			component.handleInput("ENTER");
+			await flushPresentation();
+			assert.equal(replies.length, 1, ending);
+			assert.equal(replies[0].data.details.status, "cancelled", ending);
+			assert.equal(replies[0].data.details.provenance, undefined, ending);
+			assert.doesNotMatch(JSON.stringify(replies), /private callback failure/);
+			assert.equal(signal.listenerCount(), 0, ending);
+		} finally { await picker.dispose(); }
+	}
+});
+
+test("presentation gating covers free text and multi-select without consuming early input", { timeout: 5_000 }, async () => {
+	for (const isMulti of [false, true]) {
+		const picker = await loadPicker("tui", true, 80);
+		try {
+			let acknowledge!: () => void;
+			const replies = presentationRequest(picker, {
+				params: { question: "Review?", ...(isMulti ? { multiSelect: true, options: [{ label: "Approve" }, { label: "Reject" }] } : {}) },
+				onPresented: () => new Promise<void>((resolve) => { acknowledge = resolve; }),
+			});
+			const component = await waitForComponent(picker.component);
+			await flushPresentation();
+			for (const key of ["early", "SPACE", "ENTER", "DOWN"]) component.handleInput(key);
+			assert.equal(replies.length, 0);
+			acknowledge();
+			await flushPresentation();
+			for (const key of isMulti ? ["SPACE", "DOWN", "DOWN", "DOWN", "ENTER"] : ["fresh", "ENTER"]) component.handleInput(key);
+			await flushPresentation();
+			assert.equal(replies[0].data.details.status, "answered");
+			assert.equal(replies[0].data.details.answers[0].value, isMulti ? "Approve" : "fresh");
+		} finally { await picker.dispose(); }
+	}
+});
+
+test("invalid supplied presentation callbacks fail closed while omitted callbacks retain immediate selection", { timeout: 5_000 }, async () => {
+	for (const onPresented of [undefined, null, false, "callback", 1, {}]) {
+		const picker = await loadPicker("tui", true, 80);
+		try {
+			const replies = presentationRequest(picker, { params: { question: "Review?" }, onPresented });
+			await flushPresentation();
+			assert.equal(replies[0].success, false);
+			assert.equal(picker.customCallCount(), 0);
+		} finally { await picker.dispose(); }
+	}
+	const picker = await loadPicker("tui", false, 80);
+	try {
+		const replies = presentationRequest(picker, { params: { question: "Review?", options: [{ label: "Approve" }, { label: "Reject" }] } });
+		const component = await waitForComponent(picker.component);
+		component.handleInput("ENTER");
+		await flushPresentation();
+		assert.equal(replies[0].data.details.status, "answered");
+	} finally { await picker.dispose(); }
+});
+
+test("presentation uses a captured proposal even if the caller mutates its request while queued", { timeout: 5_000 }, async () => {
+	const picker = await loadPicker("tui", true, 80);
+	try {
+		const params = { question: "Review?", details: "original exact bytes", options: [{ label: "Approve" }, { label: "Reject" }] };
+		const replies = presentationRequest(picker, { params, onPresented: async () => {} });
+		params.details = "replacement bytes";
+		params.options[0].label = "replacement choice";
+		const component = await waitForComponent(picker.component);
+		await flushPresentation();
+		assert.match(component.render(80).join("\n"), /original exact bytes/);
+		component.handleInput("ENTER");
+		await flushPresentation();
+		assert.equal(replies[0].data.details.answers[0].label, "Approve");
+		assert.equal(replies[0].data.details.context, "original exact bytes");
+	} finally { await picker.dispose(); }
+});
+
+
+test("presentation scroll and resize keep exact long details accessible while acknowledgment gates choices", { timeout: 5_000 }, async () => {
+	const picker = await loadPicker("tui", true, 24);
+	try {
+		let acknowledge!: () => void;
+		let calls = 0;
+		const details = Array.from({ length: 40 }, (_, index) => `proof-${index}  `).join("\n");
+		const replies = presentationRequest(picker, {
+			params: { question: "Review?", details, options: [{ label: "Approve" }, { label: "Reject" }] },
+			onPresented: () => { calls++; return new Promise<void>((resolve) => { acknowledge = resolve; }); },
+		});
+		const component = await waitForComponent(picker.component);
+		await flushPresentation();
+		const frames: string[] = [];
+		for (let page = 0; page < 50; page++) {
+			const lines = component.render(60);
+			assert.ok(lines.length <= 11);
+			assert.match(lines.join("\n"), /Approve/);
+			frames.push(lines.join("\n"));
+			component.handleInput("CTRL_d");
+			component.handleInput("ENTER");
+		}
+		for (let index = 0; index < 40; index++) assert.ok(frames.some((frame) => frame.includes(`proof-${index}  `)));
+		assert.equal(replies.length, 0);
+		picker.terminal.rows = 40;
+		component.render(40);
+		assert.equal(calls, 1);
+		acknowledge();
+		await flushPresentation();
+		component.handleInput("ENTER");
+		await flushPresentation();
+		assert.equal(replies[0].data.details.context, details);
+		assert.equal(replies[0].data.details.status, "answered");
+	} finally { await picker.dispose(); }
+});
+
+test("native management can acknowledge and select its single explicit option", { timeout: 5_000 }, async () => {
+	for (const option of [{ label: "Approve", value: "approve" }, { label: "Detach only", value: "detach" }]) {
+		const picker = await loadPicker("tui", false, 80);
+		try {
+			let acknowledge!: () => void;
+			let calls = 0;
+			const replies = presentationRequest(picker, {
+				params: { question: "Apply this exact approved-memory change?", details: "Exact management preview", options: [option] },
+				onPresented: () => { calls++; return new Promise<void>((resolve) => { acknowledge = resolve; }); },
+			});
+			const component = await waitForComponent(picker.component);
+			component.render(80);
+			await flushPresentation();
+			component.handleInput("ENTER");
+			assert.equal(calls, 1);
+			assert.equal(replies.length, 0);
+			acknowledge();
+			await flushPresentation();
+			component.handleInput("ENTER");
+			await flushPresentation();
+			assert.equal(replies[0].data.details.status, "answered");
+			assert.equal(replies[0].data.details.provenance, "interactive-user");
+			assert.equal(replies[0].data.details.answers[0].value, option.value);
+		} finally { await picker.dispose(); }
+	}
+});
+
+test("native tab previews render bounded tab symbols and retain exact returned context", { timeout: 5_000 }, async () => {
+	const picker = await loadPicker("tui", false, 80);
+	try {
+		const details = "\tIndented\tclaim\n\tEvidence";
+		const replies = presentationRequest(picker, {
+			params: { question: "Review?", details, options: [{ label: "Approve" }, { label: "Reject" }] },
+			onPresented: async () => {},
+		});
+		const component = await waitForComponent(picker.component);
+		const lines = component.render(40);
+		assert.match(lines.join("\n"), /␉Indented␉claim/);
+		assert.match(lines.join("\n"), /␉Evidence/);
+		assert.ok(lines.every((line) => !line.includes("\t") && line.length <= 40));
+		await flushPresentation();
+		component.handleInput("ENTER");
+		await flushPresentation();
+		assert.equal(replies[0].data.details.status, "answered");
+		assert.equal(replies[0].data.details.context, details);
+	} finally { await picker.dispose(); }
 });
