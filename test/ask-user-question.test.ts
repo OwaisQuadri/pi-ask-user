@@ -248,7 +248,7 @@ async function waitForComponent(getComponent: () => any): Promise<any> {
 	throw new Error("picker did not open");
 }
 
-test("tools that wait for the user are model-only, so codemode scripts cannot call them", async () => {
+test("tools that wait for the user declare model-only exposure", async () => {
 	const picker = await loadPicker();
 	try {
 		assert.equal(picker.tools.get("ask_user_question")?.exposure, "model-only");

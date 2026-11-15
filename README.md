@@ -10,7 +10,7 @@ A Pi extension with interactive questions and session-scoped autonomous policy g
 - **Clipboard paste.** Paste text or an image into a free-text answer.
 - **Subagent routing.** A child session's question goes to the main interactive session through Pi's event bus. One question shows at a time, and the others wait in a queue.
 - **Secure field.** With `secure: true`, the agent gets a handle such as `{{secret:3f9a01bc}}`, never the value. In the terminal interface, the value shows as you type, and Ctrl+T masks it; RPC mode has no mask. Later tool results and messages sent to the model show the handle in place of any value of 8 or more characters. The extension emits `ask-user-question:secret` with `{ handle, value }` on Pi's in-process event bus, so another extension, such as pi-credentials, can use or save it. Handles last until Pi exits.
-- **Direct calls only.** `ask_user_question` and `autonomous_mode` use Pi's `model-only` exposure. The model calls them directly; codemode scripts and other tools cannot, because a script timeout would cancel the question and lose the answer. This needs Pi 0.99.0 or newer; older Pi has no nested tool calls.
+- **Direct calls only.** `ask_user_question` and `autonomous_mode` use Pi's `model-only` exposure. In the main session, the model calls them directly; codemode scripts and other tools cannot, because a script timeout would cancel the question and lose the answer. A subagent child uses the `ask_user_question` tool from pi-subagents, which this extension does not control.
 - **Herdr status.** The extension emits `herdr:blocked` while it waits for you, so your workspace shows that the agent needs you.
 
 ## Install
@@ -78,7 +78,7 @@ A normal agent turn ending does not imply task completion.
 
 ### Open-task continuation
 
-Autonomous mode requires Pi 0.87.0 or later for its public `agent_before_settle` boundary.
+This extension requires Pi 0.99.0 or later. Autonomous mode uses the public `agent_before_settle` boundary and nested tool calls.
 Active approval marks this session's task as open until matching `task_complete`, revocation, or expiry.
 After a completed response, the extension adds one labelled custom guidance entry and requests continuation when no other continuation, pending input, or live native subagent work owns the next step.
 The entry uses the same approved principle references and safety envelope as question guidance. It is not a synthetic user answer.
