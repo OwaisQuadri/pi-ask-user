@@ -10,7 +10,7 @@ A Pi extension with interactive questions and session-scoped autonomous policy g
 - **Clipboard paste.** Paste text or an image into a free-text answer.
 - **Subagent routing.** A child session's question goes to the main interactive session through Pi's event bus. One question shows at a time, and the others wait in a queue.
 - **Secure field.** With `secure: true`, the agent gets a handle such as `{{secret:3f9a01bc}}`, never the value. In the terminal interface, the value shows as you type, and Ctrl+T masks it; RPC mode has no mask. Later tool results and messages sent to the model show the handle in place of any value of 8 or more characters. The extension emits `ask-user-question:secret` with `{ handle, value }` on Pi's in-process event bus, so another extension, such as pi-credentials, can use or save it. Handles last until Pi exits.
-- **Direct calls only.** `ask_user_question` and `autonomous_mode` use Pi's `model-only` exposure. In the main session, the model calls them directly; codemode scripts and other tools cannot, because a script timeout would cancel the question and lose the answer. A subagent child uses the `ask_user_question` tool from pi-subagents, which this extension does not control.
+- **Direct calls only.** `ask_user_question` and `autonomous_mode` use Pi's `model-only` exposure. In every session that loads this extension, the model calls them directly; codemode scripts and other tools cannot, because a script timeout would cancel the question and lose the answer. A question tool that another extension registers keeps its own exposure setting.
 - **Herdr status.** The extension emits `herdr:blocked` while it waits for you, so your workspace shows that the agent needs you.
 
 ## Install
