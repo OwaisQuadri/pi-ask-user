@@ -15,6 +15,8 @@ A Pi extension with interactive questions and session-scoped autonomous policy g
 
 ## Install
 
+This extension requires Pi 0.99.0 or later. It uses `model-only` tool exposure, nested tool calls, and the public `agent_before_settle` boundary.
+
 Install from this repository's Git URL:
 
 ```sh
@@ -78,7 +80,7 @@ A normal agent turn ending does not imply task completion.
 
 ### Open-task continuation
 
-This extension requires Pi 0.99.0 or later. Autonomous mode uses the public `agent_before_settle` boundary and nested tool calls.
+Autonomous mode uses the public `agent_before_settle` boundary and nested tool calls.
 Active approval marks this session's task as open until matching `task_complete`, revocation, or expiry.
 After a completed response, the extension adds one labelled custom guidance entry and requests continuation when no other continuation, pending input, or live native subagent work owns the next step.
 The entry uses the same approved principle references and safety envelope as question guidance. It is not a synthetic user answer.
