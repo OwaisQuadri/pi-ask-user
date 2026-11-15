@@ -248,6 +248,20 @@ async function waitForComponent(getComponent: () => any): Promise<any> {
 	throw new Error("picker did not open");
 }
 
+test("refuses a question that another tool calls, and allows a direct call", async () => {
+	const picker = await loadPicker();
+	try {
+		const toolCall = picker.lifecycleHandlers.get("tool_call");
+		const nested = await toolCall?.({ toolName: "ask_user_question", toolCallId: "c/1", parentToolCallId: "c", input: { question: "Which?" } }, picker.ctx);
+		assert.match((nested as any)?.reason ?? "", /^Call ask_user_question as a direct tool call/);
+		assert.equal((nested as any)?.block, true);
+		assert.equal(await toolCall?.({ toolName: "ask_user_question", toolCallId: "d", input: { question: "Which?" } }, picker.ctx), undefined);
+		assert.equal(await toolCall?.({ toolName: "read", toolCallId: "c/2", parentToolCallId: "c", input: {} }, picker.ctx), undefined);
+	} finally {
+		await picker.dispose();
+	}
+});
+
 test("Ctrl+V pastes clipboard text into the free-text answer", async () => {
 	const picker = await loadPicker("tui");
 	(globalThis as any).__askClipboard = {

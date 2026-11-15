@@ -1251,6 +1251,10 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		if (activeContext) refreshStatus(activeContext);
 	});
 	pi.on("agent_start", cancelRecovery);
+	pi.on("tool_call", (event) => {
+		if (event.toolName !== "ask_user_question" || event.parentToolCallId === undefined) return;
+		return { block: true, reason: "Call ask_user_question as a direct tool call, not from codemode or another tool. The caller's timeout cancels the question before the user answers." };
+	});
 	pi.on("agent_settled", (event, ctx) => {
 		const current = currentApproval(ctx);
 		if (!current) return;
