@@ -417,7 +417,7 @@ test("keeps single-select option answers", async () => {
 	}
 });
 
-test("an answered question keeps its result without writing core memory", async () => {
+test("an answered question keeps its result without extra notices", async () => {
 	const picker = await loadPicker("tui");
 	try {
 		const result = picker.tool.execute(

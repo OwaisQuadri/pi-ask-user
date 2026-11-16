@@ -50,7 +50,7 @@ Identify foreseeable approvals, recovery choices, budgets, and stop conditions d
 Use the existing credential controls for registration and grants, including owner authentication with Touch ID. Put commands that the user must run in normal chat, not a question dialog. Do not perform an operation with side effects just to trigger a grant.
 Before the final sheet, the extension checks required credential names through `cred_list` and refuses unverified or ungranted credentials. Other access checks remain agent-reported evidence for human review. Per-use authentication still applies; preparation cannot preapprove future privileged commands.
 
-The footer shows preparation, running, and human-input states. `/autonomous off` stops the mode. Dreaming and non-owning background sessions keep their existing behavior.
+The footer shows preparation, running, and human-input states. `/autonomous off` stops the mode. Non-owning background sessions keep their existing behavior.
 
 The reviewed scope contains:
 

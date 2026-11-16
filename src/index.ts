@@ -1297,7 +1297,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			"Next actor: agent. Start a grill session with the user. Ask one question at a time with ask_user_question. Settle the outcome, acceptance checks, exclusions, limits, and completion condition. Investigate available facts yourself.",
 			"Identify required credentials and permissions. Use cred_list to check metadata, never secret values. Resolve missing credentials through cred_ask and grants through the existing credential controls, including owner Touch ID. Put any /cred grant command in normal chat, not in a question dialog. Do not perform a side-effectful operation merely to trigger a grant.",
 			"Identify foreseeable approvals, recovery choices, budgets, and stop conditions before start. Complete safe access checks and record remaining per-use approvals honestly. Never mark an ungranted credential or denied permission ready. If no access is required, record that explicitly.",
-			"When the interview and access preparation are complete, call autonomous_mode on with the settled scope and preparation summary. The user must choose Approve and start. Do not change dreaming.",
+			"When the interview and access preparation are complete, call autonomous_mode on with the settled scope and preparation summary. The user must choose Approve and start.",
 		].join("\n"));
 	}
 
@@ -1424,7 +1424,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		name: "autonomous_mode",
 		label: "Autonomous mode",
 		exposure: "model-only",
-		description: "Prepare autonomous work with a human grill session and credential/permission checks first (action prepare). Ask one scope question at a time. Complete needed grants with the existing credential controls and Touch ID. Then request human approval with action on and a settled scope/preparation summary. Never approves itself. Blockers do not revoke approval. Only the user can stop with /autonomous off. Use matching task_complete only after verified completion. Do not change dreaming.",
+		description: "Prepare autonomous work with a human grill session and credential/permission checks first (action prepare). Ask one scope question at a time. Complete needed grants with the existing credential controls and Touch ID. Then request human approval with action on and a settled scope/preparation summary. Never approves itself. Blockers do not revoke approval. Only the user can stop with /autonomous off. Use matching task_complete only after verified completion.",
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("prepare"), Type.Literal("on"), Type.Literal("off"), Type.Literal("status"), Type.Literal("task_complete")]),
 			scope: Type.Optional(AutonomousScopeSchema),
