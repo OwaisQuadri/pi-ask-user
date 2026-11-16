@@ -1423,6 +1423,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "autonomous_mode",
 		label: "Autonomous mode",
+		exposure: "model-only",
 		description: "Prepare autonomous work with a human grill session and credential/permission checks first (action prepare). Ask one scope question at a time. Complete needed grants with the existing credential controls and Touch ID. Then request human approval with action on and a settled scope/preparation summary. Never approves itself. Blockers do not revoke approval. Only the user can stop with /autonomous off. Use matching task_complete only after verified completion. Do not change dreaming.",
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("prepare"), Type.Literal("on"), Type.Literal("off"), Type.Literal("status"), Type.Literal("task_complete")]),
@@ -1527,6 +1528,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ask_user_question",
 		label: "ask_user_question",
+		exposure: "model-only",
 		description:
 			"Ask the user a single question and pause execution until they answer. Use this when requirements are ambiguous, user preferences are needed, a decision would materially affect implementation, or you need confirmation before proceeding. Ask exactly one question per tool call, and prefer multiple separate tool calls over bundling unrelated questions together.",
 		promptSnippet:

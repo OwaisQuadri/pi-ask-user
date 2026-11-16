@@ -248,6 +248,16 @@ async function waitForComponent(getComponent: () => any): Promise<any> {
 	throw new Error("picker did not open");
 }
 
+test("tools that wait for the user declare model-only exposure", async () => {
+	const picker = await loadPicker();
+	try {
+		assert.equal(picker.tools.get("ask_user_question")?.exposure, "model-only");
+		assert.equal(picker.tools.get("autonomous_mode")?.exposure, "model-only");
+	} finally {
+		await picker.dispose();
+	}
+});
+
 test("Ctrl+V pastes clipboard text into the free-text answer", async () => {
 	const picker = await loadPicker("tui");
 	(globalThis as any).__askClipboard = {
