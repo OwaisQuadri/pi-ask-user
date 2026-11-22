@@ -966,7 +966,7 @@ test("autonomous enablement and widening require human confirmation, not propose
 	} finally { await picker.dispose(); }
 });
 
-test("autonomous guidance is AI labeled while secure and essential-information questions remain human", async () => {
+test("active autonomy answers every question without a dialog and defers human-only questions", async () => {
 	const picker = await loadPicker("tui");
 	try {
 		const scope = autonomousScope();
@@ -987,14 +987,21 @@ test("autonomous guidance is AI labeled while secure and essential-information q
 		assert.deepEqual(missing.details.answers, []);
 		assert.match(missing.content[0].text, /AI ROUTING ERROR/);
 		assert.equal(picker.customCallCount(), initialCount);
-		for (const params of [{ question: "Information only you hold?", policy: { ...policy, kind: "information" } }, { question: "Secret?", policy, secure: true }]) {
-			const oldComponent = picker.component();
-			const pending = picker.tool.execute("interactive", params, undefined, undefined, picker.ctx);
-			const component = await waitForComponent(() => picker.component() !== oldComponent ? picker.component() : undefined);
-			component.handleInput("human-input-value");
-			component.handleInput("ENTER");
-			assert.equal((await pending).details.provenance, "interactive-user");
+		for (const params of [
+			{ question: "Information only you hold?", policy: { ...policy, kind: "information" } },
+			{ question: "Extend the budget?", policy: { ...policy, kind: "approval" } },
+			{ question: "Secret?", policy, secure: true },
+		]) {
+			const deferred = await picker.tool.execute("deferred", params, undefined, undefined, picker.ctx);
+			assert.equal(deferred.details.status, "deferred");
+			assert.equal(deferred.details.provenance, "automatic-policy-guidance");
+			assert.deepEqual(deferred.details.answers, []);
+			assert.match(deferred.content[0].text, /DEFERRED TO USER/);
 		}
+		assert.equal(picker.customCallCount(), initialCount);
+		assert.match(picker.statuses.get("autonomous")!, /3 deferred/);
+		assert.match((await picker.tools.get("autonomous_mode").execute("status", { action: "status" }, undefined, undefined, picker.ctx)).content[0].text,
+			/Deferred questions:\n  • Information only you hold\?\n  • Extend the budget\?\n  • Secret\?/);
 		const oldComponent = picker.component();
 		const replies: any[] = [];
 		picker.api.events.on("ask-user-question:rpc:ask:reply:child", (payload) => replies.push(payload));
@@ -1010,17 +1017,17 @@ test("autonomous guidance is AI labeled while secure and essential-information q
 			{ question: "User-held information?", policy: { ...policy, kind: "information" } },
 			{ question: "Secret?", secure: true },
 		]) {
-			const requestId = `human-${replies.length}`;
-			const previous = picker.component();
-			const humanReplies: any[] = [];
-			picker.api.events.on(`ask-user-question:rpc:ask:reply:${requestId}`, (payload) => humanReplies.push(payload));
+			const requestId = `child-${params.question}`;
+			const childReplies: any[] = [];
+			picker.api.events.on(`ask-user-question:rpc:ask:reply:${requestId}`, (payload) => childReplies.push(payload));
 			picker.api.events.emit("ask-user-question:rpc:ask", { requestId, params });
-			const component = await waitForComponent(() => picker.component() !== previous ? picker.component() : undefined);
-			component.handleInput("human-input-value");
-			component.handleInput("ENTER");
-			await waitForComponent(() => humanReplies[0]);
-			assert.equal(humanReplies[0].data.details.provenance, "interactive-user");
+			await waitForComponent(() => childReplies[0]);
+			assert.equal(picker.component(), oldComponent);
+			assert.equal(childReplies[0].data.details.status, "deferred");
+			assert.equal(childReplies[0].data.details.approvalId, undefined);
+			assert.match(childReplies[0].data.content[0].text, /supervising agent as a blocker/);
 		}
+		assert.equal(picker.customCallCount(), initialCount);
 	} finally { await picker.dispose(); }
 });
 
@@ -1168,6 +1175,119 @@ test("an open autonomous task continues after a final answer until matching task
 		assert.equal((await settle(picker)).continue, true);
 		await mode.execute("complete", { action: "task_complete", taskId: "picker-task" }, undefined, undefined, picker.ctx);
 		assert.equal(await settle(picker), undefined);
+	} finally { await picker.dispose(); }
+});
+
+test("continuation stops when the agent makes no progress after a nudge while questions are deferred", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		configureNative(picker);
+		const scope = autonomousScope();
+		await approveMode(picker, scope);
+		const deferral = { question: "Extend the budget?", policy: { taskId: scope.taskId, scope: scope.scope, kind: "approval" } };
+		await picker.tool.execute("deferred", deferral, undefined, undefined, picker.ctx);
+		await picker.tool.execute("repeat", deferral, undefined, undefined, picker.ctx);
+		assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
+		const nudge = { role: "custom", customType: "autonomous-continuation", content: "continue" };
+		const working = settleEvent();
+		working.context.contextMessages.push(nudge, { role: "assistant", content: [{ type: "toolCall", name: "bash" }] });
+		assert.equal((await settle(picker, working)).continue, true);
+		const askingOnly = settleEvent();
+		askingOnly.context.contextMessages.push(nudge, { role: "assistant", content: [
+			{ type: "toolCall", name: "ask_user_question" }, { type: "toolCall", name: "autonomous_mode" },
+		] });
+		assert.equal(await settle(picker, askingOnly), undefined);
+		assert.match(picker.statuses.get("autonomous")!, /Waiting on you · 1 deferred/);
+		const idle = settleEvent();
+		idle.context.contextMessages.push(nudge, { role: "assistant", content: [{ type: "text", text: "Only deferred items remain." }] });
+		assert.equal(await settle(picker, idle), undefined);
+		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").slice(-1), [
+			{ channel: "herdr:blocked", payload: { active: true, label: "Deferred autonomous questions" } },
+		]);
+		const complete = await picker.tools.get("autonomous_mode").execute("complete", { action: "task_complete", taskId: scope.taskId }, undefined, undefined, picker.ctx);
+		assert.match(complete.content[0].text, /task_complete refused\. Approval is unchanged\. Deferred questions that still wait on the user:\n  • Extend the budget\?\n/);
+		assert.equal((await modeStatus(picker)).details.isActive, true);
+		const herdrCount = picker.emitted.filter(({ channel }) => channel === "herdr:blocked").length;
+		for (const source of ["extension", "rpc", "interactive"]) {
+			picker.lifecycleHandlers.get("input")?.({ source }, picker.ctx);
+			assert.match(picker.statuses.get("autonomous")!, /Waiting on you · 1 deferred/);
+		}
+		assert.equal(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").length, herdrCount);
+		assert.match((await modeStatus(picker)).content[0].text, /Deferred questions:\n  • Extend the budget\?/);
+		const startRun = (messageType: string) => {
+			picker.lifecycleHandlers.get("before_agent_start")?.({ messageType }, picker.ctx);
+			picker.lifecycleHandlers.get("agent_start")?.({}, picker.ctx);
+		};
+		startRun("custom");
+		assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
+		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").slice(-1), [
+			{ channel: "herdr:blocked", payload: { active: false } },
+		]);
+		picker.lifecycleHandlers.get("input")?.({ source: "interactive" }, picker.ctx);
+		startRun("custom");
+		startRun("user");
+		picker.lifecycleHandlers.get("input")?.({ source: "extension" }, picker.ctx);
+		startRun("user");
+		assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
+		picker.ctx.ui.setStatus("autonomous", "Autonomous · Connection retry 12:00 · /autonomous off");
+		picker.lifecycleHandlers.get("input")?.({ source: "rpc" }, picker.ctx);
+		assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
+		assert.equal(await settle(picker, idle), undefined);
+		picker.lifecycleHandlers.get("input")?.({ source: "interactive" }, picker.ctx);
+		picker.lifecycleHandlers.get("before_agent_start")?.({ messageType: "user" }, picker.ctx);
+		assert.match(picker.statuses.get("autonomous")!, /Running · \/autonomous off/);
+		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").slice(-1), [
+			{ channel: "herdr:blocked", payload: { active: false } },
+		]);
+		picker.lifecycleHandlers.get("agent_start")?.({}, picker.ctx);
+		assert.equal((await settle(picker, idle)).continue, true);
+		assert.match(picker.statuses.get("autonomous")!, /Running · \/autonomous off/);
+	} finally { await picker.dispose(); }
+});
+
+test("running child work is not reported as waiting on the user", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		configureNative(picker, 1);
+		const scope = autonomousScope();
+		await approveMode(picker, scope);
+		await picker.tool.execute("deferred", { question: "Extend the budget?", policy: { taskId: scope.taskId, scope: scope.scope, kind: "approval" } }, undefined, undefined, picker.ctx);
+		const idle = settleEvent();
+		idle.context.contextMessages.push({ role: "custom", customType: "autonomous-continuation", content: "continue" }, { role: "assistant", content: [{ type: "text", text: "Waiting on the child." }] });
+		assert.equal(await settle(picker, idle), undefined);
+		assert.doesNotMatch(picker.statuses.get("autonomous")!, /Waiting on you/);
+		assert.deepEqual(picker.emitted.filter(({ channel, payload }) => channel === "herdr:blocked" && (payload as any).label === "Deferred autonomous questions"), []);
+	} finally { await picker.dispose(); }
+});
+
+test("deferral keeps secrets silent, sanitizes child text, clears on revocation and leaves preparation interactive", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		configureNative(picker);
+		await picker.tools.get("autonomous_mode").execute("prepare", { action: "prepare" }, undefined, undefined, picker.ctx);
+		const previous = picker.component();
+		const preparing = picker.tool.execute("prep", { question: "May I widen scope?", policy: { taskId: "t", scope: "s", kind: "approval" } }, undefined, undefined, picker.ctx);
+		const component = await waitForComponent(() => picker.component() !== previous ? picker.component() : undefined);
+		component.handleInput("No.");
+		component.handleInput("ENTER");
+		assert.equal((await preparing).details.provenance, "interactive-user");
+		const scope = autonomousScope();
+		await approveMode(picker, scope);
+		const secret = await picker.tool.execute("secret", { question: "Token?", secure: true, policy: { taskId: scope.taskId, scope: scope.scope, kind: "routine" } }, undefined, undefined, picker.ctx);
+		assert.equal(secret.details.status, "deferred");
+		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "ask-user-question:secret"), []);
+		const replies: any[] = [];
+		picker.api.events.on("ask-user-question:rpc:ask:reply:child-multiline", (payload) => replies.push(payload));
+		picker.api.events.emit("ask-user-question:rpc:ask", { requestId: "child-multiline", params: { question: "Line one\n\u001b\u202eline\u200btwo", policy: { taskId: scope.taskId, scope: scope.scope, kind: "information" } } });
+		await waitForComponent(() => replies[0]);
+		assert.match((await modeStatus(picker)).content[0].text, /Deferred questions:\n  • Token\?\n  • Line one line two$/);
+		await picker.tool.execute("long", { question: "😀".repeat(301), policy: { taskId: scope.taskId, scope: scope.scope, kind: "information" } }, undefined, undefined, picker.ctx);
+		assert.ok((await modeStatus(picker)).content[0].text.endsWith(`  • ${"😀".repeat(300)}`));
+		await picker.tool.execute("invisible", { question: "\u200b\u202e", policy: { taskId: scope.taskId, scope: scope.scope, kind: "information" } }, undefined, undefined, picker.ctx);
+		assert.match((await modeStatus(picker)).content[0].text, /  • \(question had no visible text\)$/);
+		await picker.commands.get("autonomous").handler("off", picker.ctx);
+		await approveMode(picker, scope);
+		assert.doesNotMatch((await modeStatus(picker)).content[0].text, /Deferred questions/);
 	} finally { await picker.dispose(); }
 });
 

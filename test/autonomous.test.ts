@@ -13,7 +13,9 @@ const policy = { taskId: approval.taskId, scope: approval.scope, kind: "routine"
 const now = Date.parse("2026-01-01T01:00:00Z");
 
 test("question and continuation guidance retain provenance and boundaries without copying decision policy", () => {
-	for (const result of [guidanceForQuestion(approval, "owner", policy, false, now)!, guidanceForContinuation(approval)]) {
+	const question = guidanceForQuestion(approval, "owner", policy, false, now)!;
+	assert.equal(question.outcome, "guidance");
+	for (const result of [question.text, guidanceForContinuation(approval)]) {
 		assert.match(result, /AUTOMATIC POLICY GUIDANCE/);
 		assert.match(result, /not a human answer, selected option, or new approval/);
 		assert.match(result, /Approval ID: approval-1/);
@@ -32,32 +34,40 @@ test("question and continuation guidance retain provenance and boundaries withou
 	}
 });
 
-test("secure, approval, information, expired and child questions never receive automatic guidance", () => {
-	for (const [sessionId, metadata, isSecure, time] of [
-		["owner", policy, true, now], ["child", policy, false, now],
-		["owner", { ...policy, kind: "approval" }, false, now],
-		["owner", { ...policy, kind: "information" }, false, now],
-		["owner", policy, false, Date.parse(approval.expiresAt)],
-	] as const) assert.equal(guidanceForQuestion(approval, sessionId, metadata, isSecure, time), undefined);
+test("active autonomy defers secure, approval, information and unmatched protected questions instead of asking", () => {
+	const protectedPolicy = { ...policy, kind: "protected", protectedAction: { ...approval.protectedActions[0], bounds: "wider" } };
+	for (const [metadata, isSecure] of [
+		[policy, true], [{ ...policy, kind: "approval" }, false], [{ ...policy, kind: "information" }, false], [protectedPolicy, false],
+	] as const) {
+		const result = guidanceForQuestion(approval, "owner", metadata, isSecure, now)!;
+		assert.equal(result.outcome, "deferred");
+		assert.match(result.text, /DEFERRED TO USER: No human was asked and no dialog opened/);
+		assert.match(result.text, /Do not perform the requested action or assume an answer/);
+	}
+});
+
+test("other sessions, expired approval and inactive autonomy receive no automatic reply", () => {
+	assert.equal(guidanceForQuestion(approval, "child", policy, false, now), undefined);
+	assert.equal(guidanceForQuestion(approval, "owner", policy, false, Date.parse(approval.expiresAt)), undefined);
 	assert.equal(guidanceForQuestion(undefined, "owner", policy, false, now), undefined);
 });
 
 test("missing or mismatched task metadata returns AI routing errors rather than asking the human", () => {
 	for (const metadata of [undefined, { ...policy, scope: "Another task" }, { ...policy, taskId: "another" }, { ...policy, isReversible: false }]) {
 		const result = guidanceForQuestion(approval, "owner", metadata, false, now)!;
-		assert.match(result, /AI AUTO-REPLY/);
-		assert.match(result, /AI ROUTING ERROR: No human was asked/);
-		assert.match(result, /Never guess consent/);
+		assert.equal(result.outcome, "routing-error");
+		assert.match(result.text, /AI ROUTING ERROR: No human was asked/);
+		assert.match(result.text, /Never guess consent/);
 	}
 });
 
 test("protected guidance requires exact action, target and bounds from the approved record", () => {
 	const protectedPolicy = { ...policy, kind: "protected", protectedAction: approval.protectedActions[0] };
-	assert.match(guidanceForQuestion(approval, "owner", protectedPolicy, false, now)!, /grants no new authority/);
+	assert.match(guidanceForQuestion(approval, "owner", protectedPolicy, false, now)!.text, /grants no new authority/);
 	for (const field of ["action", "target", "bounds"]) {
 		assert.equal(guidanceForQuestion(approval, "owner", {
 			...protectedPolicy, protectedAction: { ...protectedPolicy.protectedAction, [field]: "wider" },
-		}, false, now), undefined);
+		}, false, now)!.outcome, "deferred");
 	}
 });
 

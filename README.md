@@ -50,7 +50,7 @@ Identify foreseeable approvals, recovery choices, budgets, and stop conditions d
 Use the existing credential controls for registration and grants, including owner authentication with Touch ID. Put commands that the user must run in normal chat, not a question dialog. Do not perform an operation with side effects just to trigger a grant.
 Before the final sheet, the extension checks required credential names through `cred_list` and refuses unverified or ungranted credentials. Other access checks remain agent-reported evidence for human review. Per-use authentication still applies; preparation cannot preapprove future privileged commands.
 
-The footer shows preparation, running, and human-input states. `/autonomous off` stops the mode. Non-owning background sessions keep their existing behavior.
+The footer shows preparation, running, deferred-question, and waiting states. `/autonomous off` stops the mode. Non-owning background sessions keep their existing behavior.
 
 The reviewed scope contains:
 
@@ -119,8 +119,8 @@ To request guidance for a routine reversible decision, supply metadata like this
 The `taskId` and `scope` must exactly match the human-reviewed record.
 For protected-action guidance, use `kind: "protected"` and a `protectedAction` with an exact approved `action`, `target`, and `bounds`.
 Matching uses string equality, without wildcard expansion, semantic inference, or numeric range interpretation.
-Use `kind: "approval"` for enablement, widening, or any request for new authority.
-Use `kind: "information"` only for essential information that the user alone holds, not an implementation choice the agent can investigate.
+Use `kind: "approval"` for enablement, widening, or any request for new authority. During active autonomy it is deferred, not asked.
+Use `kind: "information"` only for essential information that the user alone holds, not an implementation choice the agent can investigate. During active autonomy it is deferred, not asked.
 Metadata classifies a question; it cannot grant authority or amend the approved record.
 
 A matching nonsecure routine question returns **AI (artificial intelligence) AUTO-REPLY** and **AUTOMATIC POLICY GUIDANCE** with scope, principle references, authority limits, and the approval identifier. The terminal shows a compact AI label; expand the result to inspect the full guidance.
@@ -129,8 +129,15 @@ The agent resolves the routine decision within that guidance. The reply is never
 Human answers use `provenance: "interactive-user"`.
 
 During active autonomy, missing or mismatched metadata returns an **AI ROUTING ERROR** tool error without opening a user dialog. The agent must resolve routine work or retry with the exact task metadata and an appropriate human-input kind. A routing error never grants authority.
-Secure fields, matching approval and essential-information questions, and unmatched protected actions remain interactive. Without active approval, ordinary question behavior is unchanged.
-Routine child RPC questions during active autonomy receive an AI routing error that directs them to their supervisor. Approval, essential-information, and secure child questions remain interactive. No approval record is sent to the child. Outside active autonomy, child questions keep their existing interactive route.
+
+During active autonomy, no question opens a dialog. Secure fields, approval and essential-information questions, and unmatched protected actions return **DEFERRED TO USER** with `status: "deferred"` and an empty `answers` array. The extension records the question and asks nobody. The reply is not consent or an answer. The agent must not perform the action. It continues unaffected work and lists each deferred question, with evidence and a recommended answer, in its final report.
+The footer shows the deferred count, and `/autonomous status` lists each question once, on one line, with control and invisible formatting characters removed and a 300-character limit.
+While questions are deferred, `task_complete` is refused and approval stays active.
+Suppose the agent answers a continuation entry and calls no tool other than `ask_user_question` or `autonomous_mode`, and no child work is still running. Continuation then stops, the footer shows **Waiting on you**, and the extension emits `herdr:blocked`.
+When a new agent run starts from a message that you typed, the list clears and continuation resumes. These do not clear it: a typed message that another extension handles without a run, a message typed while the agent is running, and messages from extensions or RPC. Revocation and expiry also clear it.
+Without active approval, ordinary question behavior is unchanged.
+
+Routine child RPC questions during active autonomy receive an AI routing error that directs them to their supervisor. Approval, essential-information, and secure child questions are deferred the same way and tell the child to report a blocker to its supervisor. No approval record is sent to the child. Outside active autonomy, child questions keep their existing interactive route.
 RPC and child instances cannot enable the mode or receive the owning session's approval.
 Use the owning terminal session explicitly for approval; this extension does not infer ownership from `hasUI` alone.
 
