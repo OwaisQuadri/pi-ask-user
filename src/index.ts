@@ -1251,7 +1251,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		if (!isCurrent() || ctx.hasPendingMessages() || event.context.pendingMessages.length || event.continue
 			|| totalActive > 0 || isNativeReminderPending) return;
 		if (isStalled) {
-			if (!isWaitingOnUser) pi.events.emit("herdr:blocked", { active: true, label: `${deferredQuestions.length} deferred autonomous questions` });
+			if (!isWaitingOnUser) pi.events.emit("herdr:blocked", { active: true, label: `Deferred autonomous questions: ${deferredQuestions.length}` });
 			isWaitingOnUser = true;
 			refreshStatus(ctx);
 			return;
@@ -1281,6 +1281,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		isTypedInputLatest = false;
 		if (!isTypedRun || !deferredQuestions.length) return;
 		deferredQuestions.length = 0;
+		stopWaiting();
 		refreshStatus(ctx);
 	});
 	pi.on("agent_start", (_event, ctx) => {
@@ -1477,7 +1478,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 				return modeResult(ctx, "task_complete requires the active taskId.");
 			}
 			if (params.action === "task_complete" && deferredQuestions.length) {
-				return modeResult(ctx, `task_complete refused: ${deferredQuestions.length} deferred questions still wait on the user. Approval is unchanged. End with a final report that lists each one; the user's reply resumes the task.`);
+				return modeResult(ctx, `task_complete refused. Deferred questions that still wait on the user: ${deferredQuestions.length}. Approval is unchanged. End with a final report that lists each one; the user's reply resumes the task.`);
 			}
 			if (params.action === "task_complete" && isOwningSession(ctx)) {
 				expireApproval();
