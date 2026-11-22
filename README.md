@@ -131,7 +131,10 @@ Human answers use `provenance: "interactive-user"`.
 During active autonomy, missing or mismatched metadata returns an **AI ROUTING ERROR** tool error without opening a user dialog. The agent must resolve routine work or retry with the exact task metadata and an appropriate human-input kind. A routing error never grants authority.
 
 During active autonomy, no question opens a dialog. Secure fields, approval and essential-information questions, and unmatched protected actions return **DEFERRED TO USER** with `status: "deferred"` and an empty `answers` array. The extension records the question and asks nobody. The reply is not consent or an answer. The agent must not perform the action. It continues unaffected work and lists each deferred question, with evidence and a recommended answer, in its final report.
-The footer shows the deferred count, and `/autonomous status` lists the questions. When the agent answers a continuation entry without a tool call while questions are deferred, continuation stops and the footer shows **Waiting on you**. Your next message clears the list. Revocation, task completion, and expiry also clear it.
+The footer shows the deferred count, and `/autonomous status` lists each question once, on one line, without control characters.
+While questions are deferred, `task_complete` is refused and approval stays active.
+Suppose the agent answers a continuation entry and calls no tool other than `ask_user_question` or `autonomous_mode`. Continuation then stops, the footer shows **Waiting on you**, and the extension emits `herdr:blocked`.
+A message that you type clears the list and resumes continuation. Messages from extensions or RPC do not clear it. Revocation and expiry also clear it.
 Without active approval, ordinary question behavior is unchanged.
 
 Routine child RPC questions during active autonomy receive an AI routing error that directs them to their supervisor. Approval, essential-information, and secure child questions are deferred the same way and tell the child to report a blocker to its supervisor. No approval record is sent to the child. Outside active autonomy, child questions keep their existing interactive route.

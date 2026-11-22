@@ -1144,6 +1144,16 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
 	let recoveryAttempts = 0;
 	const deferredQuestions: string[] = [];
+	let isWaitingOnUser = false;
+	const recordDeferral = (question: string) => {
+		const text = question.replace(/[\x00-\x1f\x7f-\x9f]/gu, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+		if (!deferredQuestions.includes(text)) deferredQuestions.push(text);
+	};
+	const stopWaiting = () => {
+		if (!isWaitingOnUser) return;
+		isWaitingOnUser = false;
+		pi.events.emit("herdr:blocked", { active: false });
+	};
 	const cancelRecovery = () => {
 		clearTimeout(recoveryTimer);
 		recoveryTimer = undefined;
@@ -1158,6 +1168,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		isPreparing = false;
 		preparationAnswers = 0;
 		deferredQuestions.length = 0;
+		stopWaiting();
 		approvalRevision++;
 		activeContext?.ui.setStatus("autonomous", undefined);
 	};
@@ -1219,9 +1230,12 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		if (event.continue || event.context.pendingMessages.length || ctx.hasPendingMessages()) return;
 		const messages = event.context.contextMessages;
 		const lastNudgeIndex = messages.findLastIndex((message) => message.role === "custom" && message.customType === "autonomous-continuation");
+		const isProgress = (part: { type: string; name?: string }) => part.type === "toolCall" && part.name !== "ask_user_question" && part.name !== "autonomous_mode";
 		if (deferredQuestions.length && lastNudgeIndex !== -1 && !messages.slice(lastNudgeIndex + 1).some((message) => message.role === "assistant"
-			&& message.content.some((part) => part.type === "toolCall"))) {
+			&& message.content.some(isProgress))) {
 			refreshStatus(ctx, `Autonomous · Waiting on you · ${deferredQuestions.length} deferred · /autonomous status`);
+			if (!isWaitingOnUser) pi.events.emit("herdr:blocked", { active: true, label: `${deferredQuestions.length} deferred autonomous questions` });
+			isWaitingOnUser = true;
 			return;
 		}
 		const nativeNoticeIndex = messages.findLastIndex((message) => message.role === "custom"
@@ -1254,12 +1268,19 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			? event.message.errorMessage : undefined;
 		if (event.message.stopReason !== "error") recoveryAttempts = 0;
 	});
-	pi.on("input", () => {
+	pi.on("input", (event) => {
 		cancelRecovery();
+		if (event.source !== "interactive") return;
 		deferredQuestions.length = 0;
+		stopWaiting();
 		if (activeContext) refreshStatus(activeContext);
 	});
-	pi.on("agent_start", cancelRecovery);
+	pi.on("agent_start", (_event, ctx) => {
+		cancelRecovery();
+		if (!isWaitingOnUser) return;
+		stopWaiting();
+		refreshStatus(ctx);
+	});
 	pi.on("agent_settled", (event, ctx) => {
 		const current = currentApproval(ctx);
 		if (!current) return;
@@ -1446,6 +1467,9 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			if (params.action === "task_complete" && (!currentApproval(ctx) || params.taskId !== currentApproval(ctx)?.taskId)) {
 				return modeResult(ctx, "task_complete requires the active taskId.");
 			}
+			if (params.action === "task_complete" && deferredQuestions.length) {
+				return modeResult(ctx, `task_complete refused: ${deferredQuestions.length} deferred questions still wait on the user. Approval is unchanged. End with a final report that lists each one; the user's reply resumes the task.`);
+			}
 			if (params.action === "task_complete" && isOwningSession(ctx)) {
 				expireApproval();
 				if (params.action === "task_complete") {
@@ -1517,7 +1541,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			const data = await executeQuestion(pi, params, controller?.signal ?? request.signal, context, isCurrent, () => {
 				if (!currentApproval(context)) return undefined;
 				if (params.secure || params.policy?.kind === "approval" || params.policy?.kind === "information") {
-					deferredQuestions.push(params.question);
+					recordDeferral(params.question);
 					refreshStatus(context);
 					return { text: `${DEFERRAL_NOTICE}\nReport this deferred question to your supervising agent as a blocker.`, isDeferred: true };
 				}
@@ -1567,7 +1591,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 					const current = currentApproval(ctx);
 					const guidance = guidanceForQuestion(current, ctx.sessionManager.getSessionId(), params.policy, params.secure === true);
 					if (!guidance || !current) return undefined;
-					if (guidance.outcome === "deferred") deferredQuestions.push(params.question);
+					if (guidance.outcome === "deferred") recordDeferral(params.question);
 					return { text: guidance.text, approvalId: current.approvalId, isError: guidance.outcome === "routing-error", isDeferred: guidance.outcome === "deferred" };
 				});
 				if (isOwningSession(ctx) && isPreparing && revision === approvalRevision

@@ -1184,17 +1184,66 @@ test("continuation stops when the agent makes no progress after a nudge while qu
 		configureNative(picker);
 		const scope = autonomousScope();
 		await approveMode(picker, scope);
-		await picker.tool.execute("deferred", { question: "Extend the budget?", policy: { taskId: scope.taskId, scope: scope.scope, kind: "approval" } }, undefined, undefined, picker.ctx);
+		const deferral = { question: "Extend the budget?", policy: { taskId: scope.taskId, scope: scope.scope, kind: "approval" } };
+		await picker.tool.execute("deferred", deferral, undefined, undefined, picker.ctx);
+		await picker.tool.execute("repeat", deferral, undefined, undefined, picker.ctx);
+		assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
 		const nudge = { role: "custom", customType: "autonomous-continuation", content: "continue" };
 		const working = settleEvent();
 		working.context.contextMessages.push(nudge, { role: "assistant", content: [{ type: "toolCall", name: "bash" }] });
 		assert.equal((await settle(picker, working)).continue, true);
+		const askingOnly = settleEvent();
+		askingOnly.context.contextMessages.push(nudge, { role: "assistant", content: [
+			{ type: "toolCall", name: "ask_user_question" }, { type: "toolCall", name: "autonomous_mode" },
+		] });
+		assert.equal(await settle(picker, askingOnly), undefined);
+		assert.match(picker.statuses.get("autonomous")!, /Waiting on you · 1 deferred/);
 		const idle = settleEvent();
 		idle.context.contextMessages.push(nudge, { role: "assistant", content: [{ type: "text", text: "Only deferred items remain." }] });
 		assert.equal(await settle(picker, idle), undefined);
-		assert.match(picker.statuses.get("autonomous")!, /Waiting on you · 1 deferred/);
-		picker.lifecycleHandlers.get("input")?.({}, picker.ctx);
+		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").slice(-1), [
+			{ channel: "herdr:blocked", payload: { active: true, label: "1 deferred autonomous questions" } },
+		]);
+		const complete = await picker.tools.get("autonomous_mode").execute("complete", { action: "task_complete", taskId: scope.taskId }, undefined, undefined, picker.ctx);
+		assert.match(complete.content[0].text, /task_complete refused: 1 deferred/);
+		assert.equal((await modeStatus(picker)).details.isActive, true);
+		picker.lifecycleHandlers.get("agent_start")?.({}, picker.ctx);
+		assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
+		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").slice(-1), [
+			{ channel: "herdr:blocked", payload: { active: false } },
+		]);
+		for (const source of ["extension", "rpc"]) picker.lifecycleHandlers.get("input")?.({ source }, picker.ctx);
+		assert.equal(await settle(picker, idle), undefined);
+		picker.lifecycleHandlers.get("input")?.({ source: "interactive" }, picker.ctx);
 		assert.equal((await settle(picker, idle)).continue, true);
+		assert.match(picker.statuses.get("autonomous")!, /Running · \/autonomous off/);
+	} finally { await picker.dispose(); }
+});
+
+test("deferral keeps secrets silent, sanitizes child text, clears on revocation and leaves preparation interactive", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		configureNative(picker);
+		await picker.tools.get("autonomous_mode").execute("prepare", { action: "prepare" }, undefined, undefined, picker.ctx);
+		const previous = picker.component();
+		const preparing = picker.tool.execute("prep", { question: "May I widen scope?", policy: { taskId: "t", scope: "s", kind: "approval" } }, undefined, undefined, picker.ctx);
+		const component = await waitForComponent(() => picker.component() !== previous ? picker.component() : undefined);
+		component.handleInput("No.");
+		component.handleInput("ENTER");
+		assert.equal((await preparing).details.provenance, "interactive-user");
+		const scope = autonomousScope();
+		await approveMode(picker, scope);
+		const secret = await picker.tool.execute("secret", { question: "Token?", secure: true, policy: { taskId: scope.taskId, scope: scope.scope, kind: "routine" } }, undefined, undefined, picker.ctx);
+		assert.equal(secret.details.status, "deferred");
+		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "ask-user-question:secret"), []);
+		const replies: any[] = [];
+		picker.api.events.on("ask-user-question:rpc:ask:reply:child-multiline", (payload) => replies.push(payload));
+		picker.api.events.emit("ask-user-question:rpc:ask", { requestId: "child-multiline", params: { question: "Line one\n\u001b[31mline two", policy: { taskId: scope.taskId, scope: scope.scope, kind: "information" } } });
+		await waitForComponent(() => replies[0]);
+		assert.match((await modeStatus(picker)).content[0].text, /Deferred questions:\n  • Token\?\n  • Line one \[31mline two$/);
+		await picker.commands.get("autonomous").handler("off", picker.ctx);
+		await approveMode(picker, scope);
+		assert.doesNotMatch((await modeStatus(picker)).content[0].text, /Deferred questions/);
 	} finally { await picker.dispose(); }
 });
 

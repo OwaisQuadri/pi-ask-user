@@ -76,6 +76,7 @@ export const DEFERRAL_NOTICE = [
 	"The question is recorded for the user to review after the run. This is not a human answer, consent, selected option, or new authority.",
 	"Do not perform the requested action or assume an answer. Do not ask this question again during the run.",
 	"Continue all unaffected authorized work. When only deferred items remain, end with a final report that lists each deferred question with its evidence and your recommended answer.",
+	"Do not call task_complete while deferred questions remain; it is refused until the user replies.",
 ].join("\n");
 
 export function guidanceForQuestion(
