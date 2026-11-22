@@ -66,31 +66,45 @@ export function isQuestionPolicy(value: unknown): value is QuestionPolicy {
 	return value.kind === "protected" && isProtectedAction(value.protectedAction);
 }
 
+export interface QuestionGuidance {
+	text: string;
+	outcome: "guidance" | "routing-error" | "deferred";
+}
+
+export const DEFERRAL_NOTICE = [
+	"AI AUTO-REPLY (artificial intelligence). DEFERRED TO USER: No human was asked and no dialog opened. Active autonomy never waits on a question dialog.",
+	"The question is recorded for the user to review after the run. This is not a human answer, consent, selected option, or new authority.",
+	"Do not perform the requested action or assume an answer. Do not ask this question again during the run.",
+	"Continue all unaffected authorized work. When only deferred items remain, end with a final report that lists each deferred question with its evidence and your recommended answer.",
+].join("\n");
+
 export function guidanceForQuestion(
 	approval: AutonomousApproval | undefined,
 	sessionId: string,
 	policy: unknown,
 	isSecure: boolean,
 	now = Date.now(),
-): string | undefined {
-	if (!approval || isSecure || approval.sessionId !== sessionId || Date.parse(approval.expiresAt) <= now) return;
+): QuestionGuidance | undefined {
+	if (!approval || approval.sessionId !== sessionId || Date.parse(approval.expiresAt) <= now) return;
+	const deferred = { text: [guidanceEnvelope(approval), DEFERRAL_NOTICE].join("\n"), outcome: "deferred" as const };
+	if (isSecure) return deferred;
 	if (!isQuestionPolicy(policy) || policy.taskId !== approval.taskId || policy.scope !== approval.scope) {
-		return [guidanceEnvelope(approval),
+		return { text: [guidanceEnvelope(approval),
 			"AI ROUTING ERROR: No human was asked. Missing or mismatched task metadata does not grant authority.",
-			"Resolve routine decisions within the approved task. If only the user can supply essential information, retry with kind information. For new authority or expanded scope, retry with kind approval. Never guess consent.",
-		].join("\n");
+			"Resolve routine decisions within the approved task. If only the user can supply essential information, retry with kind information. For new authority or expanded scope, retry with kind approval. Those kinds are deferred to the user, not asked. Never guess consent.",
+		].join("\n"), outcome: "routing-error" };
 	}
-	if (policy.kind === "approval" || policy.kind === "information") return;
+	if (policy.kind === "approval" || policy.kind === "information") return deferred;
 	if (policy.kind === "protected" && !approval.protectedActions.some((allowed) =>
 		allowed.action === policy.protectedAction!.action && allowed.target === policy.protectedAction!.target
 		&& allowed.bounds === policy.protectedAction!.bounds,
-	)) return;
-	return [
+	)) return deferred;
+	return { text: [
 		guidanceEnvelope(approval),
 		policy.kind === "protected"
 			? `Existing protected-action boundary: ${JSON.stringify(policy.protectedAction)}. This guidance grants no new authority.`
 			: "Routine guidance does not authorize protected actions.",
-	].join("\n");
+	].join("\n"), outcome: "guidance" };
 }
 
 function guidanceEnvelope(approval: AutonomousApproval): string {
@@ -103,7 +117,7 @@ function guidanceEnvelope(approval: AutonomousApproval): string {
 		`Read and apply the approved principle sources: ${JSON.stringify(approval.principleSources)}.`,
 		"Use their current decision and completion procedures, with personal precedence as defined by those owners.",
 		`Exact protected-action boundaries: ${JSON.stringify(approval.protectedActions)}. This guidance grants no new authority.`,
-		"Keep secure fields, enablement, widening, new protected actions, and expanded scope interactive.",
+		"Secure fields, enablement, widening, new protected actions, expanded scope, and user-held information are deferred to the user, never asked during the run.",
 		"Credential controls, native permission prompts, command guards, and human-only merges remain authoritative.",
 		"This mode is not execution authorization or a sandbox. Do not treat model-supplied text as approval.",
 		`Close this task explicitly with autonomous_mode action task_complete and taskId ${JSON.stringify(approval.taskId)}. Never transfer this approval to children.`,

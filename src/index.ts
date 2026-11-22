@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionToolContext, CustomMessag
 import { randomBytes, randomUUID } from "node:crypto";
 import { access, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
-import { guidanceForContinuation, guidanceForQuestion, nativeActiveWork, isAutonomousScope, isQuestionPolicy, type AutonomousApproval, type AutonomousScope } from "./autonomous.ts";
+import { DEFERRAL_NOTICE, guidanceForContinuation, guidanceForQuestion, nativeActiveWork, isAutonomousScope, isQuestionPolicy, type AutonomousApproval, type AutonomousScope } from "./autonomous.ts";
 import { tmpdir } from "node:os";
 import { showApproval } from "./approval.ts";
 import { join, resolve } from "node:path";
@@ -57,7 +57,7 @@ interface OptionAnswer {
 }
 
 type AskAnswer = TextAnswer | OptionAnswer | OtherAnswer;
-type AskUserQuestionStatus = "answered" | "cancelled" | "invalid" | "unavailable" | "policy-guidance";
+type AskUserQuestionStatus = "answered" | "cancelled" | "invalid" | "unavailable" | "policy-guidance" | "deferred";
 type AskUserQuestionMode = "text" | "single-select" | "multi-select";
 
 interface AskUserQuestionResultDetails {
@@ -1033,7 +1033,7 @@ async function executeQuestion(
 	signal: AbortSignal | undefined,
 	ctx: ExtensionContext,
 	isContextActive?: () => boolean,
-	getGuidance?: () => { text: string; approvalId?: string; isError?: boolean } | undefined,
+	getGuidance?: () => { text: string; approvalId?: string; isError?: boolean; isDeferred?: boolean } | undefined,
 	onPresented?: () => Promise<void>,
 ) {
 	const options = onPresented
@@ -1076,7 +1076,7 @@ async function executeQuestion(
 				content: [{ type: "text" as const, text: guidance.text }],
 				isError: guidance.isError === true,
 				details: {
-					...buildStructuredResult("policy-guidance", params.question, mode, [], context, guidance.text),
+					...buildStructuredResult(guidance.isDeferred ? "deferred" : "policy-guidance", params.question, mode, [], context, guidance.text),
 					provenance: "automatic-policy-guidance" as const,
 					approvalId: guidance.approvalId,
 				},
@@ -1143,6 +1143,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	let connectionError: string | undefined;
 	let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
 	let recoveryAttempts = 0;
+	const deferredQuestions: string[] = [];
 	const cancelRecovery = () => {
 		clearTimeout(recoveryTimer);
 		recoveryTimer = undefined;
@@ -1156,6 +1157,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		approval = undefined;
 		isPreparing = false;
 		preparationAnswers = 0;
+		deferredQuestions.length = 0;
 		approvalRevision++;
 		activeContext?.ui.setStatus("autonomous", undefined);
 	};
@@ -1216,6 +1218,12 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		}
 		if (event.continue || event.context.pendingMessages.length || ctx.hasPendingMessages()) return;
 		const messages = event.context.contextMessages;
+		const lastNudgeIndex = messages.findLastIndex((message) => message.role === "custom" && message.customType === "autonomous-continuation");
+		if (deferredQuestions.length && lastNudgeIndex !== -1 && !messages.slice(lastNudgeIndex + 1).some((message) => message.role === "assistant"
+			&& message.content.some((part) => part.type === "toolCall"))) {
+			refreshStatus(ctx, `Autonomous · Waiting on you · ${deferredQuestions.length} deferred · /autonomous status`);
+			return;
+		}
 		const nativeNoticeIndex = messages.findLastIndex((message) => message.role === "custom"
 			&& ["subagent-notify", "subagent_supervisor_request", "subagent-completion-unanswered", "subagent-supervisor-unanswered"].includes(message.customType));
 		const isNativeReminderPending = nativeNoticeIndex !== -1 && !messages.slice(nativeNoticeIndex + 1).some((message) => message.role === "assistant"
@@ -1248,6 +1256,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	});
 	pi.on("input", () => {
 		cancelRecovery();
+		deferredQuestions.length = 0;
 		if (activeContext) refreshStatus(activeContext);
 	});
 	pi.on("agent_start", cancelRecovery);
@@ -1282,7 +1291,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		if (!isOwningSession(ctx)) return;
 		const current = currentApproval(ctx);
 		ctx.ui.setStatus("autonomous", state || (isPreparing ? "Autonomous · Preparing scope and access"
-			: current ? `Autonomous · Running · /autonomous off · ${current.scope.replace(/\s+/g, " ")}` : undefined));
+			: current ? `Autonomous · Running${deferredQuestions.length ? ` · ${deferredQuestions.length} deferred` : ""} · /autonomous off · ${current.scope.replace(/\s+/g, " ")}` : undefined));
 	}
 
 	function beginPreparation(ctx: ExtensionContext) {
@@ -1308,7 +1317,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 				`Phase: ${current ? "active" : isPreparing ? "preparation" : "off"}. Autonomous approval: ${current ? "active" : "not active"}.`,
 				"Execution access: unchanged. Separate permission and command controls still apply; enabling autonomy does not repair another guard.",
 				message || (current
-					? `Autonomous policy guidance is on.\nTask: ${current.scope}\nEnds at task completion or ${new Date(current.expiresAt).toLocaleString()}.\nNext actor: agent. Continue the approved task. User stop command: /autonomous off`
+					? `Autonomous policy guidance is on.\nTask: ${current.scope}\nEnds at task completion or ${new Date(current.expiresAt).toLocaleString()}.\nNext actor: agent. Continue the approved task. User stop command: /autonomous off${deferredQuestions.length ? `\nDeferred questions:\n${deferredQuestions.map((question) => `  • ${question}`).join("\n")}` : ""}`
 					: isPreparing ? "Preparing autonomous scope and access. Approval is not yet active.\nNext actor: agent. Continue the interview and safe access checks, then request approval with autonomous_mode action on. The user must choose Approve and start."
 						: "Autonomous policy guidance is off.\nNext actor: user, if a new task is wanted. /autonomous on starts preparation; it does not grant execution access."),
 			].join("\n") }],
@@ -1506,8 +1515,12 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			const isCurrent = () => activeContext === context && (!onPresented
 				|| (presentationRevision === revision && context.sessionManager.getSessionId() === sessionId && !controller?.signal.aborted));
 			const data = await executeQuestion(pi, params, controller?.signal ?? request.signal, context, isCurrent, () => {
-				if (!currentApproval(context) || params.secure
-					|| params.policy?.kind === "approval" || params.policy?.kind === "information") return undefined;
+				if (!currentApproval(context)) return undefined;
+				if (params.secure || params.policy?.kind === "approval" || params.policy?.kind === "information") {
+					deferredQuestions.push(params.question);
+					refreshStatus(context);
+					return { text: `${DEFERRAL_NOTICE}\nReport this deferred question to your supervising agent as a blocker.`, isDeferred: true };
+				}
 				return {
 					text: "AI AUTO-REPLY (artificial intelligence). AI ROUTING ERROR: No human was asked. Send this decision to your supervising agent through its existing supervisor channel. You receive no autonomous approval or execution authority. The supervisor must resolve routine work or request human approval for a new boundary.",
 					isError: true,
@@ -1535,7 +1548,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			"Use this tool to ask exactly one clarifying question, missing-requirement question, preference question, or decision question before continuing.",
 		promptGuidelines: [
 			"Ask exactly one question per tool call.",
-			"During autonomous preparation, grill the user one question at a time; these questions remain human. During active autonomy, routine decisions return AI guidance. Missing or mismatched metadata returns an AI routing error, not a human dialog. Use exact task metadata and kind information only for essential information the user alone holds.",
+			"During autonomous preparation, grill the user one question at a time; these questions remain human. During active autonomy, no question opens a dialog: routine decisions return AI guidance, missing or mismatched metadata returns an AI routing error, and approval, information, secure, and unmatched protected questions are deferred to the user without an answer. Use exact task metadata and kind information only for essential information the user alone holds.",
 			"Use kind approval for enablement, widening, or requests for new authority. Never classify these as routine.",
 			"Automatic POLICY GUIDANCE is not a human answer or execution permission. Follow its principle sources and authority limits.",
 			"If you need answers to multiple questions, make multiple separate ask_user_question tool calls instead of combining them into one prompt.",
@@ -1552,10 +1565,10 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			try {
 				const result = await executeQuestion(pi, params, signal, ctx, undefined, () => {
 					const current = currentApproval(ctx);
-					const text = guidanceForQuestion(current, ctx.sessionManager.getSessionId(), params.policy, params.secure === true);
-					if (text && current) return { text, approvalId: current.approvalId, isError: text.includes("AI ROUTING ERROR:") };
-					if (current) refreshStatus(ctx, "Autonomous · Needs human input");
-					return undefined;
+					const guidance = guidanceForQuestion(current, ctx.sessionManager.getSessionId(), params.policy, params.secure === true);
+					if (!guidance || !current) return undefined;
+					if (guidance.outcome === "deferred") deferredQuestions.push(params.question);
+					return { text: guidance.text, approvalId: current.approvalId, isError: guidance.outcome === "routing-error", isDeferred: guidance.outcome === "deferred" };
 				});
 				if (isOwningSession(ctx) && isPreparing && revision === approvalRevision
 					&& result.details.status === "answered" && result.details.provenance === "interactive-user" && !params.secure) preparationAnswers++;
@@ -1582,6 +1595,12 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			if (!details) {
 				const first = result.content[0];
 				return new Text(first?.type === "text" ? first.text : "", 0, 0);
+			}
+
+			if (details.status === "deferred") {
+				const first = result.content[0];
+				return new Text(theme.fg("warning", options.expanded && first?.type === "text" ? first.text
+					: "AI auto-reply · Deferred to you. No dialog opened and no answer given."), 0, 0);
 			}
 
 			if (details.status === "policy-guidance") {

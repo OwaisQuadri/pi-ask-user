@@ -966,7 +966,7 @@ test("autonomous enablement and widening require human confirmation, not propose
 	} finally { await picker.dispose(); }
 });
 
-test("autonomous guidance is AI labeled while secure and essential-information questions remain human", async () => {
+test("active autonomy answers every question without a dialog and defers human-only questions", async () => {
 	const picker = await loadPicker("tui");
 	try {
 		const scope = autonomousScope();
@@ -987,14 +987,21 @@ test("autonomous guidance is AI labeled while secure and essential-information q
 		assert.deepEqual(missing.details.answers, []);
 		assert.match(missing.content[0].text, /AI ROUTING ERROR/);
 		assert.equal(picker.customCallCount(), initialCount);
-		for (const params of [{ question: "Information only you hold?", policy: { ...policy, kind: "information" } }, { question: "Secret?", policy, secure: true }]) {
-			const oldComponent = picker.component();
-			const pending = picker.tool.execute("interactive", params, undefined, undefined, picker.ctx);
-			const component = await waitForComponent(() => picker.component() !== oldComponent ? picker.component() : undefined);
-			component.handleInput("human-input-value");
-			component.handleInput("ENTER");
-			assert.equal((await pending).details.provenance, "interactive-user");
+		for (const params of [
+			{ question: "Information only you hold?", policy: { ...policy, kind: "information" } },
+			{ question: "Extend the budget?", policy: { ...policy, kind: "approval" } },
+			{ question: "Secret?", policy, secure: true },
+		]) {
+			const deferred = await picker.tool.execute("deferred", params, undefined, undefined, picker.ctx);
+			assert.equal(deferred.details.status, "deferred");
+			assert.equal(deferred.details.provenance, "automatic-policy-guidance");
+			assert.deepEqual(deferred.details.answers, []);
+			assert.match(deferred.content[0].text, /DEFERRED TO USER/);
 		}
+		assert.equal(picker.customCallCount(), initialCount);
+		assert.match(picker.statuses.get("autonomous")!, /3 deferred/);
+		assert.match((await picker.tools.get("autonomous_mode").execute("status", { action: "status" }, undefined, undefined, picker.ctx)).content[0].text,
+			/Deferred questions:\n  • Information only you hold\?\n  • Extend the budget\?\n  • Secret\?/);
 		const oldComponent = picker.component();
 		const replies: any[] = [];
 		picker.api.events.on("ask-user-question:rpc:ask:reply:child", (payload) => replies.push(payload));
@@ -1010,17 +1017,17 @@ test("autonomous guidance is AI labeled while secure and essential-information q
 			{ question: "User-held information?", policy: { ...policy, kind: "information" } },
 			{ question: "Secret?", secure: true },
 		]) {
-			const requestId = `human-${replies.length}`;
-			const previous = picker.component();
-			const humanReplies: any[] = [];
-			picker.api.events.on(`ask-user-question:rpc:ask:reply:${requestId}`, (payload) => humanReplies.push(payload));
+			const requestId = `child-${params.question}`;
+			const childReplies: any[] = [];
+			picker.api.events.on(`ask-user-question:rpc:ask:reply:${requestId}`, (payload) => childReplies.push(payload));
 			picker.api.events.emit("ask-user-question:rpc:ask", { requestId, params });
-			const component = await waitForComponent(() => picker.component() !== previous ? picker.component() : undefined);
-			component.handleInput("human-input-value");
-			component.handleInput("ENTER");
-			await waitForComponent(() => humanReplies[0]);
-			assert.equal(humanReplies[0].data.details.provenance, "interactive-user");
+			await waitForComponent(() => childReplies[0]);
+			assert.equal(picker.component(), oldComponent);
+			assert.equal(childReplies[0].data.details.status, "deferred");
+			assert.equal(childReplies[0].data.details.approvalId, undefined);
+			assert.match(childReplies[0].data.content[0].text, /supervising agent as a blocker/);
 		}
+		assert.equal(picker.customCallCount(), initialCount);
 	} finally { await picker.dispose(); }
 });
 
@@ -1168,6 +1175,26 @@ test("an open autonomous task continues after a final answer until matching task
 		assert.equal((await settle(picker)).continue, true);
 		await mode.execute("complete", { action: "task_complete", taskId: "picker-task" }, undefined, undefined, picker.ctx);
 		assert.equal(await settle(picker), undefined);
+	} finally { await picker.dispose(); }
+});
+
+test("continuation stops when the agent makes no progress after a nudge while questions are deferred", async () => {
+	const picker = await loadPicker("tui");
+	try {
+		configureNative(picker);
+		const scope = autonomousScope();
+		await approveMode(picker, scope);
+		await picker.tool.execute("deferred", { question: "Extend the budget?", policy: { taskId: scope.taskId, scope: scope.scope, kind: "approval" } }, undefined, undefined, picker.ctx);
+		const nudge = { role: "custom", customType: "autonomous-continuation", content: "continue" };
+		const working = settleEvent();
+		working.context.contextMessages.push(nudge, { role: "assistant", content: [{ type: "toolCall", name: "bash" }] });
+		assert.equal((await settle(picker, working)).continue, true);
+		const idle = settleEvent();
+		idle.context.contextMessages.push(nudge, { role: "assistant", content: [{ type: "text", text: "Only deferred items remain." }] });
+		assert.equal(await settle(picker, idle), undefined);
+		assert.match(picker.statuses.get("autonomous")!, /Waiting on you · 1 deferred/);
+		picker.lifecycleHandlers.get("input")?.({}, picker.ctx);
+		assert.equal((await settle(picker, idle)).continue, true);
 	} finally { await picker.dispose(); }
 });
 
