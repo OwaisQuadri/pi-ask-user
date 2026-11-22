@@ -1146,7 +1146,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	const deferredQuestions: string[] = [];
 	let isWaitingOnUser = false;
 	const recordDeferral = (question: string) => {
-		const text = Array.from(question.replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim()).slice(0, 300).join("");
+		const text = Array.from(question.replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim()).slice(0, 300).join("") || "(question had no visible text)";
 		if (!deferredQuestions.includes(text)) deferredQuestions.push(text);
 	};
 	const stopWaiting = () => {

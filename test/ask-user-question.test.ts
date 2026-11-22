@@ -1258,6 +1258,8 @@ test("deferral keeps secrets silent, sanitizes child text, clears on revocation 
 		assert.match((await modeStatus(picker)).content[0].text, /Deferred questions:\n  • Token\?\n  • Line one line two$/);
 		await picker.tool.execute("long", { question: "😀".repeat(301), policy: { taskId: scope.taskId, scope: scope.scope, kind: "information" } }, undefined, undefined, picker.ctx);
 		assert.ok((await modeStatus(picker)).content[0].text.endsWith(`  • ${"😀".repeat(300)}`));
+		await picker.tool.execute("invisible", { question: "\u200b\u202e", policy: { taskId: scope.taskId, scope: scope.scope, kind: "information" } }, undefined, undefined, picker.ctx);
+		assert.match((await modeStatus(picker)).content[0].text, /  • \(question had no visible text\)$/);
 		await picker.commands.get("autonomous").handler("off", picker.ctx);
 		await approveMode(picker, scope);
 		assert.doesNotMatch((await modeStatus(picker)).content[0].text, /Deferred questions/);
