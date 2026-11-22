@@ -1202,10 +1202,10 @@ test("continuation stops when the agent makes no progress after a nudge while qu
 		idle.context.contextMessages.push(nudge, { role: "assistant", content: [{ type: "text", text: "Only deferred items remain." }] });
 		assert.equal(await settle(picker, idle), undefined);
 		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").slice(-1), [
-			{ channel: "herdr:blocked", payload: { active: true, label: "Deferred autonomous questions: 1" } },
+			{ channel: "herdr:blocked", payload: { active: true, label: "Deferred autonomous questions" } },
 		]);
 		const complete = await picker.tools.get("autonomous_mode").execute("complete", { action: "task_complete", taskId: scope.taskId }, undefined, undefined, picker.ctx);
-		assert.match(complete.content[0].text, /task_complete refused\. Deferred questions that still wait on the user: 1\./);
+		assert.match(complete.content[0].text, /task_complete refused\. Approval is unchanged\. Deferred questions that still wait on the user:\n  • Extend the budget\?\n/);
 		assert.equal((await modeStatus(picker)).details.isActive, true);
 		const herdrCount = picker.emitted.filter(({ channel }) => channel === "herdr:blocked").length;
 		for (const source of ["extension", "rpc", "interactive"]) {
