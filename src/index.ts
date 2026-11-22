@@ -1271,9 +1271,10 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	});
 	pi.on("input", (event) => {
 		cancelRecovery();
-		if (event.source !== "interactive") return;
-		deferredQuestions.length = 0;
-		stopWaiting();
+		if (event.source === "interactive") {
+			deferredQuestions.length = 0;
+			stopWaiting();
+		}
 		if (activeContext) refreshStatus(activeContext);
 	});
 	pi.on("agent_start", (_event, ctx) => {

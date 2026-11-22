@@ -1212,7 +1212,11 @@ test("continuation stops when the agent makes no progress after a nudge while qu
 		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").slice(-1), [
 			{ channel: "herdr:blocked", payload: { active: false } },
 		]);
-		for (const source of ["extension", "rpc"]) picker.lifecycleHandlers.get("input")?.({ source }, picker.ctx);
+		for (const source of ["extension", "rpc"]) {
+			picker.ctx.ui.setStatus("autonomous", "Autonomous · Connection retry 12:00 · /autonomous off");
+			picker.lifecycleHandlers.get("input")?.({ source }, picker.ctx);
+			assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
+		}
 		assert.equal(await settle(picker, idle), undefined);
 		picker.lifecycleHandlers.get("input")?.({ source: "interactive" }, picker.ctx);
 		assert.equal((await settle(picker, idle)).continue, true);
