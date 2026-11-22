@@ -1256,7 +1256,7 @@ test("running child work is not reported as waiting on the user", async () => {
 		idle.context.contextMessages.push({ role: "custom", customType: "autonomous-continuation", content: "continue" }, { role: "assistant", content: [{ type: "text", text: "Waiting on the child." }] });
 		assert.equal(await settle(picker, idle), undefined);
 		assert.doesNotMatch(picker.statuses.get("autonomous")!, /Waiting on you/);
-		assert.deepEqual(picker.emitted.filter(({ channel, payload }) => channel === "herdr:blocked" && (payload as any).label?.includes("deferred")), []);
+		assert.deepEqual(picker.emitted.filter(({ channel, payload }) => channel === "herdr:blocked" && (payload as any).label === "Deferred autonomous questions"), []);
 	} finally { await picker.dispose(); }
 });
 
