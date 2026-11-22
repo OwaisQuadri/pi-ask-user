@@ -134,7 +134,7 @@ During active autonomy, no question opens a dialog. Secure fields, approval and 
 The footer shows the deferred count, and `/autonomous status` lists each question once, on one line, with control and invisible formatting characters removed and a 300-character limit.
 While questions are deferred, `task_complete` is refused and approval stays active.
 Suppose the agent answers a continuation entry and calls no tool other than `ask_user_question` or `autonomous_mode`, and no child work is still running. Continuation then stops, the footer shows **Waiting on you**, and the extension emits `herdr:blocked`.
-When an agent turn starts from a message that you typed, the list clears and continuation resumes. A typed message that another extension handles without a turn, and messages from extensions or RPC, do not clear it. Revocation and expiry also clear it.
+When a new agent run starts from a message that you typed, the list clears and continuation resumes. These do not clear it: a typed message that another extension handles without a run, a message typed while the agent is running, and messages from extensions or RPC. Revocation and expiry also clear it.
 Without active approval, ordinary question behavior is unchanged.
 
 Routine child RPC questions during active autonomy receive an AI routing error that directs them to their supervisor. Approval, essential-information, and secure child questions are deferred the same way and tell the child to report a blocker to its supervisor. No approval record is sent to the child. Outside active autonomy, child questions keep their existing interactive route.

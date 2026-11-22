@@ -1276,11 +1276,16 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		isTypedInputLatest = event.source === "interactive";
 		if (activeContext) refreshStatus(activeContext);
 	});
+	pi.on("before_agent_start", (event, ctx) => {
+		const isTypedRun = event.messageType === "user" && isTypedInputLatest;
+		isTypedInputLatest = false;
+		if (!isTypedRun || !deferredQuestions.length) return;
+		deferredQuestions.length = 0;
+		refreshStatus(ctx);
+	});
 	pi.on("agent_start", (_event, ctx) => {
 		cancelRecovery();
-		if (!isWaitingOnUser && !isTypedInputLatest) return;
-		if (isTypedInputLatest) deferredQuestions.length = 0;
-		isTypedInputLatest = false;
+		if (!isWaitingOnUser) return;
 		stopWaiting();
 		refreshStatus(ctx);
 	});

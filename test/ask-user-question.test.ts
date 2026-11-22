@@ -1214,18 +1214,27 @@ test("continuation stops when the agent makes no progress after a nudge while qu
 		}
 		assert.equal(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").length, herdrCount);
 		assert.match((await modeStatus(picker)).content[0].text, /Deferred questions:\n  • Extend the budget\?/);
-		picker.lifecycleHandlers.get("input")?.({ source: "extension" }, picker.ctx);
-		picker.lifecycleHandlers.get("agent_start")?.({}, picker.ctx);
+		const startRun = (messageType: string) => {
+			picker.lifecycleHandlers.get("before_agent_start")?.({ messageType }, picker.ctx);
+			picker.lifecycleHandlers.get("agent_start")?.({}, picker.ctx);
+		};
+		startRun("custom");
 		assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
 		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").slice(-1), [
 			{ channel: "herdr:blocked", payload: { active: false } },
 		]);
+		picker.lifecycleHandlers.get("input")?.({ source: "interactive" }, picker.ctx);
+		startRun("custom");
+		startRun("user");
+		picker.lifecycleHandlers.get("input")?.({ source: "extension" }, picker.ctx);
+		startRun("user");
+		assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
 		picker.ctx.ui.setStatus("autonomous", "Autonomous · Connection retry 12:00 · /autonomous off");
 		picker.lifecycleHandlers.get("input")?.({ source: "rpc" }, picker.ctx);
 		assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
 		assert.equal(await settle(picker, idle), undefined);
 		picker.lifecycleHandlers.get("input")?.({ source: "interactive" }, picker.ctx);
-		picker.lifecycleHandlers.get("agent_start")?.({}, picker.ctx);
+		startRun("user");
 		assert.equal((await settle(picker, idle)).continue, true);
 		assert.match(picker.statuses.get("autonomous")!, /Running · \/autonomous off/);
 	} finally { await picker.dispose(); }
