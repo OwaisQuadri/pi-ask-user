@@ -1146,7 +1146,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	const deferredQuestions: string[] = [];
 	let isWaitingOnUser = false;
 	const recordDeferral = (question: string) => {
-		const text = question.replace(/[\x00-\x1f\x7f-\x9f]/gu, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+		const text = Array.from(question.replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim()).slice(0, 300).join("");
 		if (!deferredQuestions.includes(text)) deferredQuestions.push(text);
 	};
 	const stopWaiting = () => {
@@ -1231,13 +1231,8 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		const messages = event.context.contextMessages;
 		const lastNudgeIndex = messages.findLastIndex((message) => message.role === "custom" && message.customType === "autonomous-continuation");
 		const isProgress = (part: { type: string; name?: string }) => part.type === "toolCall" && part.name !== "ask_user_question" && part.name !== "autonomous_mode";
-		if (deferredQuestions.length && lastNudgeIndex !== -1 && !messages.slice(lastNudgeIndex + 1).some((message) => message.role === "assistant"
-			&& message.content.some(isProgress))) {
-			refreshStatus(ctx, `Autonomous · Waiting on you · ${deferredQuestions.length} deferred · /autonomous status`);
-			if (!isWaitingOnUser) pi.events.emit("herdr:blocked", { active: true, label: `${deferredQuestions.length} deferred autonomous questions` });
-			isWaitingOnUser = true;
-			return;
-		}
+		const isStalled = deferredQuestions.length > 0 && lastNudgeIndex !== -1 && !messages.slice(lastNudgeIndex + 1).some((message) => message.role === "assistant"
+			&& message.content.some(isProgress));
 		const nativeNoticeIndex = messages.findLastIndex((message) => message.role === "custom"
 			&& ["subagent-notify", "subagent_supervisor_request", "subagent-completion-unanswered", "subagent-supervisor-unanswered"].includes(message.customType));
 		const isNativeReminderPending = nativeNoticeIndex !== -1 && !messages.slice(nativeNoticeIndex + 1).some((message) => message.role === "assistant"
@@ -1253,6 +1248,12 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		}
 		if (!isCurrent() || ctx.hasPendingMessages() || event.context.pendingMessages.length || event.continue
 			|| totalActive > 0 || isNativeReminderPending) return;
+		if (isStalled) {
+			refreshStatus(ctx, `Autonomous · Waiting on you · ${deferredQuestions.length} deferred · /autonomous status`);
+			if (!isWaitingOnUser) pi.events.emit("herdr:blocked", { active: true, label: `${deferredQuestions.length} deferred autonomous questions` });
+			isWaitingOnUser = true;
+			return;
+		}
 		return {
 			entries: [...event.entries, {
 				type: "custom_message" as const, customType: "autonomous-continuation", display: true,
