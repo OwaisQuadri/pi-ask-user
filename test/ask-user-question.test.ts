@@ -1207,18 +1207,25 @@ test("continuation stops when the agent makes no progress after a nudge while qu
 		const complete = await picker.tools.get("autonomous_mode").execute("complete", { action: "task_complete", taskId: scope.taskId }, undefined, undefined, picker.ctx);
 		assert.match(complete.content[0].text, /task_complete refused: 1 deferred/);
 		assert.equal((await modeStatus(picker)).details.isActive, true);
+		const herdrCount = picker.emitted.filter(({ channel }) => channel === "herdr:blocked").length;
+		for (const source of ["extension", "rpc", "interactive"]) {
+			picker.lifecycleHandlers.get("input")?.({ source }, picker.ctx);
+			assert.match(picker.statuses.get("autonomous")!, /Waiting on you · 1 deferred/);
+		}
+		assert.equal(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").length, herdrCount);
+		assert.match((await modeStatus(picker)).content[0].text, /Deferred questions:\n  • Extend the budget\?/);
+		picker.lifecycleHandlers.get("input")?.({ source: "extension" }, picker.ctx);
 		picker.lifecycleHandlers.get("agent_start")?.({}, picker.ctx);
 		assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
 		assert.deepEqual(picker.emitted.filter(({ channel }) => channel === "herdr:blocked").slice(-1), [
 			{ channel: "herdr:blocked", payload: { active: false } },
 		]);
-		for (const source of ["extension", "rpc"]) {
-			picker.ctx.ui.setStatus("autonomous", "Autonomous · Connection retry 12:00 · /autonomous off");
-			picker.lifecycleHandlers.get("input")?.({ source }, picker.ctx);
-			assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
-		}
+		picker.ctx.ui.setStatus("autonomous", "Autonomous · Connection retry 12:00 · /autonomous off");
+		picker.lifecycleHandlers.get("input")?.({ source: "rpc" }, picker.ctx);
+		assert.match(picker.statuses.get("autonomous")!, /Running · 1 deferred/);
 		assert.equal(await settle(picker, idle), undefined);
 		picker.lifecycleHandlers.get("input")?.({ source: "interactive" }, picker.ctx);
+		picker.lifecycleHandlers.get("agent_start")?.({}, picker.ctx);
 		assert.equal((await settle(picker, idle)).continue, true);
 		assert.match(picker.statuses.get("autonomous")!, /Running · \/autonomous off/);
 	} finally { await picker.dispose(); }

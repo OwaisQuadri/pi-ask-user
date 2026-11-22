@@ -1145,6 +1145,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	let recoveryAttempts = 0;
 	const deferredQuestions: string[] = [];
 	let isWaitingOnUser = false;
+	let isTypedInputLatest = false;
 	const recordDeferral = (question: string) => {
 		const text = Array.from(question.replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim()).slice(0, 300).join("") || "(question had no visible text)";
 		if (!deferredQuestions.includes(text)) deferredQuestions.push(text);
@@ -1168,6 +1169,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		isPreparing = false;
 		preparationAnswers = 0;
 		deferredQuestions.length = 0;
+		isTypedInputLatest = false;
 		stopWaiting();
 		approvalRevision++;
 		activeContext?.ui.setStatus("autonomous", undefined);
@@ -1249,9 +1251,9 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		if (!isCurrent() || ctx.hasPendingMessages() || event.context.pendingMessages.length || event.continue
 			|| totalActive > 0 || isNativeReminderPending) return;
 		if (isStalled) {
-			refreshStatus(ctx, `Autonomous · Waiting on you · ${deferredQuestions.length} deferred · /autonomous status`);
 			if (!isWaitingOnUser) pi.events.emit("herdr:blocked", { active: true, label: `${deferredQuestions.length} deferred autonomous questions` });
 			isWaitingOnUser = true;
+			refreshStatus(ctx);
 			return;
 		}
 		return {
@@ -1271,15 +1273,14 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 	});
 	pi.on("input", (event) => {
 		cancelRecovery();
-		if (event.source === "interactive") {
-			deferredQuestions.length = 0;
-			stopWaiting();
-		}
+		isTypedInputLatest = event.source === "interactive";
 		if (activeContext) refreshStatus(activeContext);
 	});
 	pi.on("agent_start", (_event, ctx) => {
 		cancelRecovery();
-		if (!isWaitingOnUser) return;
+		if (!isWaitingOnUser && !isTypedInputLatest) return;
+		if (isTypedInputLatest) deferredQuestions.length = 0;
+		isTypedInputLatest = false;
 		stopWaiting();
 		refreshStatus(ctx);
 	});
@@ -1314,6 +1315,7 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 		if (!isOwningSession(ctx)) return;
 		const current = currentApproval(ctx);
 		ctx.ui.setStatus("autonomous", state || (isPreparing ? "Autonomous · Preparing scope and access"
+			: current && isWaitingOnUser ? `Autonomous · Waiting on you · ${deferredQuestions.length} deferred · /autonomous status`
 			: current ? `Autonomous · Running${deferredQuestions.length ? ` · ${deferredQuestions.length} deferred` : ""} · /autonomous off · ${current.scope.replace(/\s+/g, " ")}` : undefined));
 	}
 
